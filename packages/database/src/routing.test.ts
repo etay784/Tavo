@@ -8,7 +8,7 @@ import {
   insertSystemSecurityEvent,
   resolveWhatsappIntegration,
 } from "./routing";
-import { insertInboundEvent, insertWhatsappIntegration } from "./phase2";
+import { insertInboundEvent } from "./phase2";
 
 const TENANT_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -32,11 +32,17 @@ describe("SECURITY DEFINER routing", () => {
     appPool = new Pool({ connectionString: pg.appUrl, max: 4 });
     superClient = new Client({ connectionString: pg.superuserUrl });
     await superClient.connect();
-    const integA = await withTenant(appPool, TENANT_A, (c) => insertWhatsappIntegration(c, TENANT_A, "pn-a"));
-    await withTenant(appPool, TENANT_B, (c) => insertWhatsappIntegration(c, TENANT_B, "pn-b"));
+    const integA = await superClient.query<{ id: string }>(
+      `INSERT INTO whatsapp_integrations (tenant_id, phone_number_id) VALUES ($1,'pn-a') RETURNING id`,
+      [TENANT_A],
+    );
+    await superClient.query(
+      `INSERT INTO whatsapp_integrations (tenant_id, phone_number_id) VALUES ($1,'pn-b')`,
+      [TENANT_B],
+    );
     await withTenant(appPool, TENANT_A, (c) =>
       insertInboundEvent(c, TENANT_A, {
-        integrationId: integA.id,
+        integrationId: integA.rows[0]!.id,
         providerMessageId: "wamid-a1",
         eventKind: "message_text",
         status: "RECEIVED",
@@ -238,5 +244,18 @@ describe("SECURITY DEFINER routing", () => {
       `SELECT has_table_privilege('tavo_app', 'public.offered_slots', 'DELETE') AS del`,
     );
     expect(offered.rows[0]?.del).toBe(false);
+    const integrations = await superClient.query<{
+      sel: boolean;
+      ins: boolean;
+      upd: boolean;
+      del: boolean;
+    }>(
+      `SELECT
+         has_table_privilege('tavo_app', 'public.whatsapp_integrations', 'SELECT') AS sel,
+         has_table_privilege('tavo_app', 'public.whatsapp_integrations', 'INSERT') AS ins,
+         has_table_privilege('tavo_app', 'public.whatsapp_integrations', 'UPDATE') AS upd,
+         has_table_privilege('tavo_app', 'public.whatsapp_integrations', 'DELETE') AS del`,
+    );
+    expect(integrations.rows[0]).toEqual({ sel: true, ins: false, upd: false, del: false });
   });
 });

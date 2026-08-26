@@ -8,7 +8,7 @@ import {
   withTenant,
   type EphemeralPg,
 } from "@tavo/database";
-import { parseKeyring, decryptUtf8 } from "@tavo/security";
+import { parseKeyring, decryptUtf8, sealPhone, normalizePhone } from "@tavo/security";
 import { CatalogService, AppointmentService, SchedulingService } from "@tavo/domain";
 import { FakeAIProvider } from "@tavo/ai";
 import { FakeWhatsAppProvider } from "@tavo/whatsapp";
@@ -69,6 +69,9 @@ describe("phase 2A whatsapp worker", () => {
     const admin = new Client({ connectionString: pg.migratorUrl });
     await admin.connect();
     await admin.query(`INSERT INTO businesses (id, name, timezone) VALUES ($1,'Pilot','Asia/Jerusalem')`, [TENANT]);
+    await admin.query(`INSERT INTO whatsapp_integrations (tenant_id, phone_number_id) VALUES ($1,'pn-pilot')`, [
+      TENANT,
+    ]);
     await admin.end();
     pool = new Pool({ connectionString: pg.appUrl, max: 8 });
     catalog = new CatalogService(pool);
@@ -87,11 +90,6 @@ describe("phase 2A whatsapp worker", () => {
     for (const dow of [0, 1, 2, 3, 4]) {
       await catalog.setWorkingHours(ctx, staff.id, dow, "09:00", "19:00");
     }
-    await withTenant(pool, TENANT, async (c) => {
-      await c.query(`INSERT INTO whatsapp_integrations (tenant_id, phone_number_id) VALUES ($1,'pn-pilot')`, [
-        TENANT,
-      ]);
-    });
   }, 60_000);
 
   afterAll(async () => {
@@ -316,19 +314,274 @@ describe("phase 2A whatsapp worker", () => {
     expect(offers).toBe(0);
   });
 
-  it("asks for a service when more than one is active", async () => {
-    await catalog.createService(ctx, {
+  it("does not book from a stale offer after returning to IDLE", async () => {
+    const from = "972500100001";
+    const raw1 = JSON.stringify(textPayload("wamid-stale-av", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-stale", processor);
+    await runOutboundOnce(pool, "w-stale", phoneKeys, messages, fakeWa);
+    const raw2 = JSON.stringify(textPayload("wamid-stale-2", "את השני", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-stale", processor);
+    await runOutboundOnce(pool, "w-stale", phoneKeys, messages, fakeWa);
+    const before = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM appointments a
+         JOIN customers cu ON cu.id = a.customer_id
+         JOIN whatsapp_inbound_events e ON e.conversation_id IN (SELECT id FROM conversations WHERE customer_id = cu.id)
+         WHERE e.provider_message_id = 'wamid-stale-av'`,
+      );
+      return r.rows[0]!.n;
+    });
+    const raw3 = JSON.stringify(textPayload("wamid-stale-1", "1", from));
+    await persistParsedWebhook(pool, Buffer.from(raw3), JSON.parse(raw3), messages, routingKey);
+    await runInboundOnce(pool, "w-stale", processor);
+    await runOutboundOnce(pool, "w-stale", phoneKeys, messages, fakeWa);
+    const after = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM appointments a
+         JOIN conversations conv ON conv.customer_id = a.customer_id
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-stale-av'`,
+      );
+      return r.rows[0]!.n;
+    });
+    expect(after).toBe(before);
+    const state = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ state: string; current_offer_set_id: string | null }>(
+        `SELECT conv.state, conv.current_offer_set_id
+         FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-stale-av'`,
+      );
+      return r.rows[0]!;
+    });
+    expect(state.state).toBe("IDLE");
+    expect(state.current_offer_set_id).toBeNull();
+  });
+
+  it("selects a service by ordinal then books that service", async () => {
+    const beard = await catalog.createService(ctx, {
       name: "זקן",
       durationMinutes: 20,
       priceMinor: 4000,
     });
-    const raw = JSON.stringify(textPayload("wamid-svc", "יש משהו מחר בערב?", "972509000001"));
+    const noa = await catalog.createStaff(ctx, "Noa");
+    await catalog.assignService(ctx, noa.id, beard.id);
+    for (const dow of [0, 1, 2, 3, 4]) {
+      await catalog.setWorkingHours(ctx, noa.id, dow, "09:00", "19:00");
+    }
+    const from = "972500100002";
+    const raw1 = JSON.stringify(textPayload("wamid-pick-av", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-pick", processor);
+    await runOutboundOnce(pool, "w-pick", phoneKeys, messages, fakeWa);
+    const choices = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(choices).toContain("איזה שירות");
+    expect(choices).toContain("זקן");
+    const raw2 = JSON.stringify(textPayload("wamid-pick-1", "1", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-pick", processor);
+    await runOutboundOnce(pool, "w-pick", phoneKeys, messages, fakeWa);
+    const offer = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(offer).toContain("זמין:");
+    const raw3 = JSON.stringify(textPayload("wamid-pick-book", "את הראשון", from));
+    await persistParsedWebhook(pool, Buffer.from(raw3), JSON.parse(raw3), messages, routingKey);
+    await runInboundOnce(pool, "w-pick", processor);
+    await runOutboundOnce(pool, "w-pick", phoneKeys, messages, fakeWa);
+    expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("התור נקבע");
+    const booked = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ name: string }>(
+        `SELECT s.name FROM appointments a
+         JOIN services s ON s.id = a.service_id
+         JOIN conversations conv ON conv.customer_id = a.customer_id
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-pick-book' AND a.source = 'WHATSAPP'`,
+      );
+      return r.rows[0]?.name;
+    });
+    expect(booked).toBe("זקן");
+  });
+
+  it("reschedules after the customer chooses among multiple future appointments", async () => {
+    const scheduling = new SchedulingService(pool, clock);
+    const appointments = new AppointmentService(pool, scheduling, phoneKeys);
+    const staffId = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(`SELECT id FROM staff_members LIMIT 1`);
+      return r.rows[0]!.id;
+    });
+    const serviceId = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(`SELECT id FROM services WHERE name = 'תספורת' LIMIT 1`);
+      return r.rows[0]!.id;
+    });
+    const from = "972500100003";
+    await appointments.create(ctx, {
+      staffId,
+      serviceId,
+      startAt: new Date("2026-08-26T07:00:00.000Z"),
+      customerPhone: from,
+    });
+    await appointments.create(ctx, {
+      staffId,
+      serviceId,
+      startAt: new Date("2026-08-26T08:00:00.000Z"),
+      customerPhone: from,
+    });
+    const raw1 = JSON.stringify(textPayload("wamid-rs1", "לשנות תור", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-rs", processor);
+    await runOutboundOnce(pool, "w-rs", phoneKeys, messages, fakeWa);
+    const list = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(list).toContain("התורים שלכם:");
+    const state1 = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ state: string; pending_appointment_id: string | null }>(
+        `SELECT conv.state, conv.pending_appointment_id FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-rs1'`,
+      );
+      return r.rows[0]!;
+    });
+    expect(state1.state).toBe("AWAITING_RESCHEDULE_APPOINTMENT");
+    expect(state1.pending_appointment_id).toBeNull();
+    const raw2 = JSON.stringify(textPayload("wamid-rs2", "1", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-rs", processor);
+    await runOutboundOnce(pool, "w-rs", phoneKeys, messages, fakeWa);
+    expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("זמין:");
+    const raw3 = JSON.stringify(textPayload("wamid-rs3", "את הראשון", from));
+    await persistParsedWebhook(pool, Buffer.from(raw3), JSON.parse(raw3), messages, routingKey);
+    await runInboundOnce(pool, "w-rs", processor);
+    await runOutboundOnce(pool, "w-rs", phoneKeys, messages, fakeWa);
+    expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("התור עודכן");
+  });
+
+  it("ignores past confirmed appointments in WhatsApp cancel and list", async () => {
+    const from = "972500100004";
+    const sealed = sealPhone(normalizePhone(from), phoneKeys);
+    const ids = await withTenant(pool, TENANT, async (c) => {
+      const cust = await c.query<{ id: string }>(
+        `INSERT INTO customers (tenant_id, phone_encrypted, phone_encryption_key_version, phone_lookup_hash, phone_lookup_key_version)
+         VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        [
+          TENANT,
+          sealed.phoneEncrypted,
+          sealed.phoneEncryptionKeyVersion,
+          sealed.phoneLookupHash,
+          sealed.phoneLookupKeyVersion,
+        ],
+      );
+      const staff = await c.query<{ id: string }>(`SELECT id FROM staff_members LIMIT 1`);
+      const svc = await c.query<{ id: string }>(`SELECT id FROM services WHERE name = 'תספורת' LIMIT 1`);
+      const appt = await c.query<{ id: string; status: string }>(
+        `INSERT INTO appointments (
+           tenant_id, customer_id, staff_id, service_id,
+           start_at, end_at, occupied_start_at, occupied_end_at, status, source
+         ) VALUES ($1,$2,$3,$4,
+           '2026-08-20 10:00+00','2026-08-20 10:30+00',
+           '2026-08-20 10:00+00','2026-08-20 10:30+00','CONFIRMED','INTERNAL')
+         RETURNING id, status`,
+        [TENANT, cust.rows[0]!.id, staff.rows[0]!.id, svc.rows[0]!.id],
+      );
+      return { customerId: cust.rows[0]!.id, appointmentId: appt.rows[0]!.id };
+    });
+    const raw1 = JSON.stringify(textPayload("wamid-past-list", "מה התורים", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-past", processor);
+    await runOutboundOnce(pool, "w-past", phoneKeys, messages, fakeWa);
+    expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("לא מצאתי תור");
+    const raw2 = JSON.stringify(textPayload("wamid-past-cancel", "לבטל", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-past", processor);
+    await runOutboundOnce(pool, "w-past", phoneKeys, messages, fakeWa);
+    const still = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ status: string }>(`SELECT status FROM appointments WHERE id = $1`, [
+        ids.appointmentId,
+      ]);
+      return r.rows[0]!.status;
+    });
+    expect(still).toBe("CONFIRMED");
+  });
+
+  it("defers a second inbound without consuming retry budget while the conversation is leased", async () => {
+    const from = "972500100005";
+    ai.delayMs = 250;
+    const raw1 = JSON.stringify(textPayload("wamid-busy-a", "יש משהו מחר בערב?", from));
+    const raw2 = JSON.stringify(textPayload("wamid-busy-b", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await Promise.all([runInboundOnce(pool, "w-busy-1", processor), runInboundOnce(pool, "w-busy-2", processor)]);
+    ai.delayMs = 0;
+    const rows = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ provider_message_id: string; status: string; attempt_count: number }>(
+        `SELECT provider_message_id, status, attempt_count
+         FROM whatsapp_inbound_events
+         WHERE provider_message_id IN ('wamid-busy-a','wamid-busy-b')
+         ORDER BY provider_message_id`,
+      );
+      return r.rows;
+    });
+    const deferred = rows.find((r) => r.status === "RECEIVED");
+    const done = rows.find((r) => r.status === "PROCESSED");
+    expect(done).toBeTruthy();
+    expect(deferred).toBeTruthy();
+    expect(deferred!.attempt_count).toBe(0);
+    expect(rows.every((r) => r.status !== "DEAD")).toBe(true);
+  });
+
+  it("terminalizes an unexpected apply failure on attempt 8", async () => {
+    const from = "972500100006";
+    const raw = JSON.stringify(textPayload("wamid-apply8", "יש משהו מחר בערב?", from));
     await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
-    await runInboundOnce(pool, "w-svc", processor);
-    await runOutboundOnce(pool, "w-svc", phoneKeys, messages, fakeWa);
-    const body = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
-    expect(body).toContain("איזה שירות");
-    expect(body).toContain("זקן");
+    await withTenant(pool, TENANT, async (c) => {
+      await c.query(
+        `UPDATE whatsapp_inbound_events SET attempt_count = 7 WHERE provider_message_id = 'wamid-apply8'`,
+      );
+    });
+    processor.failNextApply = true;
+    await runInboundOnce(pool, "w-apply8", processor);
+    const st = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ status: string; attempt_count: number }>(
+        `SELECT status, attempt_count FROM whatsapp_inbound_events WHERE provider_message_id = 'wamid-apply8'`,
+      );
+      return r.rows[0]!;
+    });
+    expect(st.status).toBe("DEAD");
+    expect(st.attempt_count).toBe(8);
+  });
+
+  it("terminalizes outbound load failure on attempt 8", async () => {
+    const from = "972500100007";
+    const raw = JSON.stringify(textPayload("wamid-out8", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+    await runInboundOnce(pool, "w-out8", processor);
+    const outId = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(
+        `SELECT o.id FROM whatsapp_outbound_messages o
+         JOIN whatsapp_inbound_events e ON e.id = o.caused_by_inbound_event_id
+         WHERE e.provider_message_id = 'wamid-out8'`,
+      );
+      return r.rows[0]!.id;
+    });
+    await withTenant(pool, TENANT, async (c) => {
+      await c.query(`UPDATE whatsapp_outbound_messages SET status = 'SENT' WHERE id <> $1 AND status = 'PENDING'`, [
+        outId,
+      ]);
+      await c.query(`UPDATE whatsapp_outbound_messages SET attempt_count = 7 WHERE id = $1`, [outId]);
+    });
+    const badMessages = {
+      encryptionKeyring: parseKeyring(JSON.stringify({ "1": "ee".repeat(32) })),
+      writeVersion: 1,
+    };
+    await runOutboundOnce(pool, "w-out8", phoneKeys, badMessages, fakeWa);
+    const st = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ status: string }>(
+        `SELECT o.status FROM whatsapp_outbound_messages o
+         JOIN whatsapp_inbound_events e ON e.id = o.caused_by_inbound_event_id
+         WHERE e.provider_message_id = 'wamid-out8'`,
+      );
+      return r.rows[0]!.status;
+    });
+    expect(st).toBe("FAILED");
   });
 
   it("cancels only the authenticated customer's appointment", async () => {
@@ -345,10 +598,10 @@ describe("phase 2A whatsapp worker", () => {
     const victim = await appointments.create(ctx, {
       staffId: staff,
       serviceId: service,
-      startAt: new Date("2026-08-26T07:00:00.000Z"),
+      startAt: new Date("2026-08-27T07:00:00.000Z"),
       customerPhone: "972509111111",
     });
-    ai.nextIntent = { intent: "CANCEL_BOOKING", confidence: 0.99, appointment_id: victim.id };
+    ai.nextIntent = { intent: "CANCEL_BOOKING", confidence: 0.99 };
     const raw = JSON.stringify(textPayload("wamid-xcancel", "לבטל", "972509222222"));
     await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
     await runInboundOnce(pool, "w-xcancel", processor);

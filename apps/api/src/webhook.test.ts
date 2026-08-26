@@ -37,11 +37,9 @@ describe("meta webhook http", () => {
     const admin = new Client({ connectionString: pg.migratorUrl });
     await admin.connect();
     await admin.query(`INSERT INTO businesses (id, name, timezone) VALUES ($1,'A','Asia/Jerusalem')`, [TENANT]);
+    await admin.query(`INSERT INTO whatsapp_integrations (tenant_id, phone_number_id) VALUES ($1,'pn-a')`, [TENANT]);
     await admin.end();
     pool = new Pool({ connectionString: pg.appUrl, max: 4 });
-    await withTenant(pool, TENANT, async (c) => {
-      await c.query(`INSERT INTO whatsapp_integrations (tenant_id, phone_number_id) VALUES ($1,'pn-a')`, [TENANT]);
-    });
     const config: AppConfig = {
       databaseUrl: pg.appUrl,
       apiKeys: new Map([["key-a", TENANT]]),

@@ -152,7 +152,7 @@ export class AppointmentService {
     client: PoolClient,
     ctx: TrustedTenantContext,
     appointmentId: string,
-    command?: { commandKey: string; inboundEventId: string; customerId: string },
+    command?: { commandKey: string; inboundEventId: string; customerId: string; notBefore?: Date },
   ) {
     if (command) {
       const existing = await getBookingCommand(client, ctx.tenantId, command.commandKey);
@@ -166,6 +166,9 @@ export class AppointmentService {
       throw Errors.notFound("appointment");
     }
     if (command && existing.customer_id !== command.customerId) {
+      throw Errors.notFound("appointment");
+    }
+    if (command?.notBefore && existing.start_at.getTime() <= command.notBefore.getTime()) {
       throw Errors.notFound("appointment");
     }
     const row = await cancelAppointment(client, ctx.tenantId, appointmentId);

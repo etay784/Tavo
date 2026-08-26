@@ -193,6 +193,22 @@ export async function releaseConversationLease(
   return (r.rowCount ?? 0) === 1;
 }
 
+export async function lockConversationLease(
+  client: PoolClient,
+  tenantId: string,
+  conversationId: string,
+  leaseToken: string,
+  lockVersion: number,
+) {
+  const r = await client.query<{ lock_version: number }>(
+    `SELECT lock_version FROM conversations
+     WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4
+     FOR UPDATE`,
+    [tenantId, conversationId, leaseToken, lockVersion],
+  );
+  return r.rows[0];
+}
+
 export async function updateConversationState(
   client: PoolClient,
   tenantId: string,
@@ -212,7 +228,7 @@ export async function updateConversationState(
      SET state = $5,
          service_id = $6,
          pending_appointment_id = $7,
-         current_offer_set_id = COALESCE($8, current_offer_set_id),
+         current_offer_set_id = $8,
          clarify_count = COALESCE($9, clarify_count),
          updated_at = now()
      WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4`,
@@ -229,6 +245,25 @@ export async function updateConversationState(
     ],
   );
   return (r.rowCount ?? 0) === 1;
+}
+
+export async function markInboundDeferred(
+  client: PoolClient,
+  tenantId: string,
+  id: string,
+  retrySeconds: number,
+) {
+  await client.query(
+    `UPDATE whatsapp_inbound_events
+     SET status = 'RECEIVED',
+         attempt_count = GREATEST(attempt_count - 1, 0),
+         next_attempt_at = now() + make_interval(secs => $3),
+         lock_expires_at = NULL,
+         locked_by = NULL,
+         last_error = 'conversation_busy'
+     WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, id, retrySeconds],
+  );
 }
 
 export async function markInboundProcessed(
@@ -560,14 +595,59 @@ export async function listCustomerAppointments(
   client: PoolClient,
   tenantId: string,
   customerId: string,
+  now: Date,
 ) {
   const r = await client.query<AppointmentRow>(
     `SELECT id, tenant_id, customer_id, staff_id, service_id, location_id,
             start_at, end_at, occupied_start_at, occupied_end_at, status, source
      FROM appointments
-     WHERE tenant_id = $1 AND customer_id = $2 AND status = 'CONFIRMED'
+     WHERE tenant_id = $1 AND customer_id = $2 AND status = 'CONFIRMED' AND start_at > $3
      ORDER BY start_at`,
-    [tenantId, customerId],
+    [tenantId, customerId, now],
   );
   return r.rows;
+}
+
+export async function listStaffNames(client: PoolClient, tenantId: string) {
+  const r = await client.query<{ id: string; name: string }>(
+    `SELECT id, name FROM staff_members WHERE tenant_id = $1 AND active = true ORDER BY name`,
+    [tenantId],
+  );
+  return r.rows;
+}
+
+export async function consumeLlmBudgetWindow(
+  client: PoolClient,
+  tenantId: string,
+  senderSubject: string,
+  now: Date,
+  senderPerMinute: number,
+  tenantPerHour: number,
+): Promise<boolean> {
+  await client.query(
+    `DELETE FROM llm_budget_windows WHERE tenant_id = $1 AND window_start < $2`,
+    [tenantId, new Date(now.getTime() - 3 * 60 * 60 * 1000)],
+  );
+  const minuteStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000);
+  const hourStart = new Date(Math.floor(now.getTime() / 3_600_000) * 3_600_000);
+  const sender = await client.query<{ hit_count: number }>(
+    `INSERT INTO llm_budget_windows (tenant_id, subject_key, window_kind, window_start, hit_count)
+     VALUES ($1, $2, 'sender_minute', $3, 1)
+     ON CONFLICT (tenant_id, subject_key, window_kind, window_start)
+     DO UPDATE SET hit_count = llm_budget_windows.hit_count + 1
+     RETURNING hit_count`,
+    [tenantId, senderSubject, minuteStart],
+  );
+  const tenant = await client.query<{ hit_count: number }>(
+    `INSERT INTO llm_budget_windows (tenant_id, subject_key, window_kind, window_start, hit_count)
+     VALUES ($1, 'tenant', 'tenant_hour', $2, 1)
+     ON CONFLICT (tenant_id, subject_key, window_kind, window_start)
+     DO UPDATE SET hit_count = llm_budget_windows.hit_count + 1
+     RETURNING hit_count`,
+    [tenantId, hourStart],
+  );
+  return (
+    (sender.rows[0]?.hit_count ?? 0) <= senderPerMinute &&
+    (tenant.rows[0]?.hit_count ?? 0) <= tenantPerHour
+  );
 }

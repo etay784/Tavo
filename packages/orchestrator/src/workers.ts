@@ -5,6 +5,7 @@ import {
   getCustomer,
   getIntegration,
   getOutboundMessage,
+  markInboundFailed,
   markOutboundAmbiguous,
   markOutboundFailed,
   markOutboundSent,
@@ -12,7 +13,7 @@ import {
   withTenant,
 } from "@tavo/database";
 import { decryptPhone, decryptUtf8, type PhoneCryptoConfig } from "@tavo/security";
-import { OUTBOUND_MAX_ATTEMPTS, retryBackoffSeconds } from "@tavo/shared";
+import { INBOUND_MAX_ATTEMPTS, OUTBOUND_MAX_ATTEMPTS, retryBackoffSeconds } from "@tavo/shared";
 import {
   AmbiguousSendError,
   ClientSendError,
@@ -34,7 +35,20 @@ export async function runInboundOnce(
     client.release();
   }
   if (!claimed) return false;
-  await processor.processClaimedJob(claimed.job_id, claimed.tenant_id, workerId);
+  try {
+    await processor.processClaimedJob(claimed.job_id, claimed.tenant_id, workerId);
+  } catch (e) {
+    await withTenant(pool, claimed.tenant_id, (c) =>
+      markInboundFailed(
+        c,
+        claimed.tenant_id,
+        claimed.job_id,
+        e instanceof Error ? e.message : "inbound",
+        retryBackoffSeconds(8),
+        INBOUND_MAX_ATTEMPTS,
+      ),
+    );
+  }
   return true;
 }
 
@@ -55,33 +69,54 @@ export async function runOutboundOnce(
   }
   if (!claimed) return false;
 
-  const loaded = await withTenant(pool, claimed.tenant_id, async (txn) => {
-    const row = await getOutboundMessage(txn, claimed!.tenant_id, claimed!.outbox_id);
-    if (!row) return null;
-    const customer = await getCustomer(txn, claimed!.tenant_id, row.customer_id);
-    const integration = await getIntegration(txn, claimed!.tenant_id, row.integration_id);
-    if (!customer || !integration) {
-      await markOutboundFailed(txn, claimed!.tenant_id, row.id, "missing customer");
-      return null;
-    }
-    const toE164 = decryptPhone(
-      customer.phone_encrypted,
-      phones.encryptionKeyring,
-      customer.phone_encryption_key_version,
+  let loaded: {
+    id: string;
+    phoneNumberId: string;
+    toE164: string;
+    body: string;
+    attemptCount: number;
+  } | null = null;
+  try {
+    loaded = await withTenant(pool, claimed.tenant_id, async (txn) => {
+      const row = await getOutboundMessage(txn, claimed!.tenant_id, claimed!.outbox_id);
+      if (!row) return null;
+      const customer = await getCustomer(txn, claimed!.tenant_id, row.customer_id);
+      const integration = await getIntegration(txn, claimed!.tenant_id, row.integration_id);
+      if (!customer || !integration) {
+        await markOutboundFailed(txn, claimed!.tenant_id, row.id, "missing customer");
+        return null;
+      }
+      const toE164 = decryptPhone(
+        customer.phone_encrypted,
+        phones.encryptionKeyring,
+        customer.phone_encryption_key_version,
+      );
+      const body = decryptUtf8(
+        row.body_encrypted,
+        messages.encryptionKeyring,
+        row.message_encryption_key_version,
+      );
+      return {
+        id: row.id,
+        phoneNumberId: integration.phone_number_id,
+        toE164,
+        body,
+        attemptCount: row.attempt_count,
+      };
+    });
+  } catch (e) {
+    await withTenant(pool, claimed.tenant_id, (txn) =>
+      markOutboundTransient(
+        txn,
+        claimed.tenant_id,
+        claimed.outbox_id,
+        e instanceof Error ? e.message : "load",
+        retryBackoffSeconds(8),
+        OUTBOUND_MAX_ATTEMPTS,
+      ),
     );
-    const body = decryptUtf8(
-      row.body_encrypted,
-      messages.encryptionKeyring,
-      row.message_encryption_key_version,
-    );
-    return {
-      id: row.id,
-      phoneNumberId: integration.phone_number_id,
-      toE164,
-      body,
-      attemptCount: row.attempt_count,
-    };
-  });
+    return true;
+  }
   if (!loaded) return true;
 
   try {

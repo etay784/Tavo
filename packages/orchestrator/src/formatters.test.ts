@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { civilWindow } from "./inbound-processor";
 import {
   FALLBACK_HE,
   PAYMENT_UNAVAILABLE_HE,
@@ -31,5 +32,15 @@ describe("deterministic formatters", () => {
   it("does not claim a human received the message", () => {
     expect(FALLBACK_HE).not.toMatch(/הועבר|נציג|בעל העסק קיבל/);
     expect(PAYMENT_UNAVAILABLE_HE).not.toMatch(/הועבר/);
+  });
+});
+
+describe("civilWindow", () => {
+  it("treats THIS_WEEK as the remaining week, not TODAY", () => {
+    const now = new Date("2026-08-25T08:00:00.000Z");
+    const week = civilWindow(now, "Asia/Jerusalem", "THIS_WEEK", "EVENING");
+    const today = civilWindow(now, "Asia/Jerusalem", "TODAY", "EVENING");
+    expect(week.to.getTime()).toBeGreaterThan(today.to.getTime());
+    expect(week.from.getTime()).toBe(now.getTime());
   });
 });

@@ -193,4 +193,6 @@ Until that harness exists, tests call domain services and repositories directly.
 
 See `ADR/0007`–`ADR/0012`. Runtime uses `tavo_routing` SECURITY DEFINER helpers (`search_path = pg_catalog`, schema-qualified names) to resolve integrations and claim jobs, then `tavo_app` + transaction-local RLS. No real LLM provider (`ADR/0012` deferred). `tavo_app` has no `BYPASSRLS` and no `CREATE` on `public` or `tavo_routing`.
 
+WhatsApp GET_BOOKING / CANCEL_BOOKING / RESCHEDULE_BOOKING operate only on the authenticated customer's **future** `CONFIRMED` appointments (`start_at` strictly after the trusted worker clock). Past confirmed rows remain in the database but are not listed or mutated through WhatsApp.
+
 Phase 2A customer replies are deterministic formatters (no free-form wrapper authority). Slot ordinals are unique per `offer_set_id`. Webhook HTTP 200 is returned only after durable persist of supported text events (or intentional ignore of signed status/unsupported). Inbound/outbound workers use bounded retries, `DEAD`/`FAILED` terminals, unique conversation lease tokens, and do not hold a PostgreSQL transaction open across AI or Graph I/O.

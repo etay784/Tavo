@@ -1,29 +1,26 @@
-import {
-  LLM_SENDER_PER_MINUTE,
-  LLM_TENANT_PER_HOUR,
-} from "@tavo/shared";
-
-type Bucket = { n: number; reset: number };
-
-const senderMinute = new Map<string, Bucket>();
-const tenantHour = new Map<string, Bucket>();
-
-function hit(map: Map<string, Bucket>, key: string, limit: number, windowMs: number): boolean {
-  const now = Date.now();
-  const cur = map.get(key);
-  if (!cur || now > cur.reset) {
-    map.set(key, { n: 1, reset: now + windowMs });
-    return true;
-  }
-  cur.n += 1;
-  return cur.n <= limit;
-}
-
-/** Returns true if the call is within budget. */
-export function consumeLlmBudget(tenantId: string, senderKey: string): boolean {
-  const senderOk = hit(senderMinute, `${tenantId}:${senderKey}`, LLM_SENDER_PER_MINUTE, 60_000);
-  const tenantOk = hit(tenantHour, tenantId, LLM_TENANT_PER_HOUR, 60 * 60_000);
-  return senderOk && tenantOk;
-}
+import { createHash } from "node:crypto";
+import type { PoolClient } from "pg";
+import { consumeLlmBudgetWindow } from "@tavo/database";
+import { LLM_SENDER_PER_MINUTE, LLM_TENANT_PER_HOUR } from "@tavo/shared";
 
 export const LLM_BUDGET_HE = "כרגע יש עומס. נסו שוב בעוד דקה.";
+
+export function llmSenderSubject(customerId: string): string {
+  return createHash("sha256").update(customerId, "utf8").digest("hex");
+}
+
+export async function consumeLlmBudget(
+  client: PoolClient,
+  tenantId: string,
+  customerId: string,
+  now: Date,
+): Promise<boolean> {
+  return consumeLlmBudgetWindow(
+    client,
+    tenantId,
+    llmSenderSubject(customerId),
+    now,
+    LLM_SENDER_PER_MINUTE,
+    LLM_TENANT_PER_HOUR,
+  );
+}

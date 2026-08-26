@@ -50,9 +50,6 @@ CREATE TABLE conversations (
   customer_id uuid NOT NULL,
   state conversation_state NOT NULL DEFAULT 'IDLE',
   service_id uuid,
-  pending_appointment_id uuid,
-  current_offer_set_id uuid,
-  lease_token text,
   clarify_count integer NOT NULL DEFAULT 0 CHECK (clarify_count >= 0),
   lease_owner text,
   lease_expires_at timestamptz,
@@ -110,7 +107,6 @@ CREATE TABLE whatsapp_outbound_messages (
   locked_by text,
   lock_expires_at timestamptz,
   last_error text,
-  retry_class text CHECK (retry_class IS NULL OR retry_class IN ('TRANSIENT')),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, id),
@@ -140,7 +136,6 @@ CREATE TABLE offered_slots (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id uuid NOT NULL REFERENCES businesses (id),
   conversation_id uuid NOT NULL,
-  offer_set_id uuid NOT NULL,
   slot_ref text NOT NULL,
   staff_id uuid NOT NULL,
   service_id uuid NOT NULL,
@@ -152,7 +147,7 @@ CREATE TABLE offered_slots (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, slot_ref),
-  UNIQUE (tenant_id, offer_set_id, ordinal),
+  UNIQUE (tenant_id, conversation_id, ordinal),
   FOREIGN KEY (tenant_id, conversation_id) REFERENCES conversations (tenant_id, id),
   FOREIGN KEY (tenant_id, staff_id) REFERENCES staff_members (tenant_id, id),
   FOREIGN KEY (tenant_id, service_id) REFERENCES services (tenant_id, id),
@@ -203,13 +198,10 @@ GRANT USAGE ON TYPE conversation_state TO tavo_app;
 GRANT USAGE ON TYPE booking_command_operation TO tavo_app;
 GRANT USAGE ON TYPE message_direction TO tavo_app;
 
-GRANT SELECT, INSERT, UPDATE ON public.whatsapp_integrations TO tavo_app;
-GRANT SELECT, INSERT, UPDATE ON public.conversations TO tavo_app;
-GRANT SELECT, INSERT, UPDATE ON public.whatsapp_inbound_events TO tavo_app;
-GRANT SELECT, INSERT, UPDATE ON public.whatsapp_outbound_messages TO tavo_app;
-GRANT SELECT, INSERT ON public.messages TO tavo_app;
-GRANT SELECT, INSERT, UPDATE ON public.offered_slots TO tavo_app;
-GRANT SELECT, INSERT ON public.booking_commands TO tavo_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON
+  whatsapp_integrations, conversations, whatsapp_inbound_events,
+  whatsapp_outbound_messages, messages, offered_slots, booking_commands
+  TO tavo_app;
 
 REVOKE ALL ON TABLE system_security_events FROM PUBLIC;
 REVOKE ALL ON TABLE system_security_events FROM tavo_app;
@@ -284,8 +276,6 @@ BEGIN
     SELECT e.id
     FROM public.whatsapp_inbound_events AS e
     WHERE e.event_kind = 'message_text'
-      AND e.status <> 'DEAD'
-      AND e.attempt_count < 8
       AND (
         (
           e.status IN ('RECEIVED', 'FAILED')
@@ -330,7 +320,6 @@ BEGIN
     SELECT o.id
     FROM public.whatsapp_outbound_messages AS o
     WHERE o.status = 'PENDING'
-      AND o.attempt_count < 8
       AND o.next_attempt_at <= pg_catalog.now()
       AND (o.lock_expires_at IS NULL OR o.lock_expires_at < pg_catalog.now())
     ORDER BY o.created_at ASC
