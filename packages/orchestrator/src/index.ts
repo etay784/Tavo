@@ -1,4 +1,4 @@
-export { InboundProcessor, civilWindow } from "./inbound-processor";
+export { InboundProcessor, civilWindow, slotInLocalMinutes } from "./inbound-processor";
 export type { MessageCrypto } from "./inbound-processor";
 export { persistParsedWebhook, WebhookPersistError } from "./persist-webhook";
 export { runInboundOnce, runOutboundOnce } from "./workers";

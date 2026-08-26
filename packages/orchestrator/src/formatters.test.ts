@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { civilWindow } from "./inbound-processor";
+import { DateTime } from "luxon";
+import { civilWindow, slotInLocalMinutes } from "./inbound-processor";
 import {
   FALLBACK_HE,
   PAYMENT_UNAVAILABLE_HE,
@@ -36,11 +37,55 @@ describe("deterministic formatters", () => {
 });
 
 describe("civilWindow", () => {
-  it("treats THIS_WEEK as the remaining week, not TODAY", () => {
+  it("treats THIS_WEEK as the remaining Israeli week, not TODAY", () => {
     const now = new Date("2026-08-25T08:00:00.000Z");
     const week = civilWindow(now, "Asia/Jerusalem", "THIS_WEEK", "EVENING");
     const today = civilWindow(now, "Asia/Jerusalem", "TODAY", "EVENING");
     expect(week.to.getTime()).toBeGreaterThan(today.to.getTime());
     expect(week.from.getTime()).toBe(now.getTime());
+    expect(week.minuteFrom).toBe(17 * 60);
+    expect(week.minuteTo).toBe(21 * 60);
+  });
+
+  it("keeps EVENING on THIS_WEEK and ends the week on Saturday", () => {
+    const now = new Date("2026-08-25T08:00:00.000Z");
+    const week = civilWindow(now, "Asia/Jerusalem", "THIS_WEEK", "EVENING");
+    const localEnd = DateTime.fromJSDate(week.to, { zone: "utc" }).setZone("Asia/Jerusalem");
+    expect(localEnd.weekday).toBe(6);
+    expect(week.minuteFrom).toBe(17 * 60);
+  });
+
+  it("includes Sunday when THIS_WEEK starts on Sunday", () => {
+    const sunday = new Date("2026-08-23T08:00:00.000Z");
+    const week = civilWindow(sunday, "Asia/Jerusalem", "THIS_WEEK", "EVENING");
+    expect(week.from.getTime()).toBe(sunday.getTime());
+    const localFrom = DateTime.fromJSDate(week.from, { zone: "utc" }).setZone("Asia/Jerusalem");
+    expect(localFrom.weekday).toBe(7);
+  });
+
+  it("applies time_from only without dropping it", () => {
+    const now = new Date("2026-08-25T08:00:00.000Z");
+    const w = civilWindow(now, "Asia/Jerusalem", "TODAY", "EVENING", { timeFrom: "18:30" });
+    const localFrom = DateTime.fromJSDate(w.from, { zone: "utc" }).setZone("Asia/Jerusalem");
+    expect(localFrom.toFormat("HH:mm")).toBe("18:30");
+    expect(w.minuteFrom).toBe(18 * 60 + 30);
+    expect(w.minuteTo).toBe(21 * 60);
+  });
+
+  it("applies time_to only without dropping it", () => {
+    const now = new Date("2026-08-25T06:00:00.000Z");
+    const w = civilWindow(now, "Asia/Jerusalem", "TODAY", "MORNING", { timeTo: "11:00" });
+    const localTo = DateTime.fromJSDate(w.to, { zone: "utc" }).setZone("Asia/Jerusalem");
+    expect(localTo.toFormat("HH:mm")).toBe("11:00");
+    expect(w.minuteFrom).toBe(9 * 60);
+    expect(w.minuteTo).toBe(11 * 60);
+  });
+
+  it("does not treat THIS_WEEK evening as morning", () => {
+    const week = civilWindow(new Date("2026-08-25T08:00:00.000Z"), "Asia/Jerusalem", "THIS_WEEK", "EVENING");
+    const morning = new Date("2026-08-26T06:00:00.000Z");
+    const evening = new Date("2026-08-26T15:00:00.000Z");
+    expect(slotInLocalMinutes(morning, "Asia/Jerusalem", week.minuteFrom, week.minuteTo)).toBe(false);
+    expect(slotInLocalMinutes(evening, "Asia/Jerusalem", week.minuteFrom, week.minuteTo)).toBe(true);
   });
 });

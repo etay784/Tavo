@@ -5,15 +5,38 @@ export const PAYMENT_UNAVAILABLE_HE = "תשלום בצ׳אט עדיין לא ז�
 export const PICK_SERVICE_HE = "איזה שירות?";
 export const CANCELLED_HE = "התור בוטל.";
 export const NO_BOOKING_HE = "לא מצאתי תור פעיל על השם הזה.";
+export const SLOT_UNAVAILABLE_HE = "השעה הזו כבר לא פנויה.";
+export const CLARIFY_STAFF_HE = "לא מצאתי איש צוות בשם הזה. אפשר לכתוב את השם המלא?";
+export const AMBIGUOUS_STAFF_HE = "יש כמה אנשי צוות דומים. אפשר לכתוב את השם המלא?";
+export const CLARIFY_SERVICE_HE = "לא מצאתי שירות בשם הזה. אפשר לבחור מהרשימה?";
+export const AMBIGUOUS_SERVICE_HE = "יש כמה שירותים דומים. אפשר לבחור מספר מהרשימה?";
+
+export function formatOfferedOptionLabel(
+  startAt: Date,
+  staffName: string,
+  timeZone: string,
+): string {
+  const local = DateTime.fromJSDate(startAt, { zone: "utc" }).setZone(timeZone);
+  return `${local.toFormat("HH:mm")} אצל ${staffName}`;
+}
+
+export function formatAppointmentOptionLabel(input: {
+  startAt: Date;
+  serviceName: string;
+  staffName: string;
+  timeZone: string;
+}): string {
+  const local = DateTime.fromJSDate(input.startAt, { zone: "utc" }).setZone(input.timeZone);
+  return `${input.serviceName} אצל ${input.staffName} ב-${local.toFormat("dd/LL HH:mm")}`;
+}
 
 export function formatAvailabilityList(
   slots: { ordinal: number; startAt: Date; staffName: string }[],
   timeZone: string,
 ): string {
-  const lines = slots.map((s) => {
-    const local = DateTime.fromJSDate(s.startAt, { zone: "utc" }).setZone(timeZone);
-    return `${s.ordinal}) ${local.toFormat("HH:mm")} אצל ${s.staffName}`;
-  });
+  const lines = slots.map(
+    (s) => `${s.ordinal}) ${formatOfferedOptionLabel(s.startAt, s.staffName, timeZone)}`,
+  );
   return ["זמין:", ...lines].join("\n");
 }
 
@@ -46,10 +69,9 @@ export function formatBookingsList(
   timeZone: string,
 ): string {
   if (rows.length === 0) return NO_BOOKING_HE;
-  const lines = rows.map((r, i) => {
-    const local = DateTime.fromJSDate(r.startAt, { zone: "utc" }).setZone(timeZone);
-    return `${i + 1}) ${r.serviceName} אצל ${r.staffName} ב-${local.toFormat("dd/LL HH:mm")}`;
-  });
+  const lines = rows.map(
+    (r, i) => `${i + 1}) ${formatAppointmentOptionLabel({ ...r, timeZone })}`,
+  );
   return ["התורים שלכם:", ...lines].join("\n");
 }
 

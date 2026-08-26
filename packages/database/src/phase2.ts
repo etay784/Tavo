@@ -130,13 +130,14 @@ export async function upsertConversation(
     clarify_count: number;
     current_offer_set_id: string | null;
     pending_appointment_id: string | null;
+    pending_request: unknown;
   }>(
     `INSERT INTO conversations (tenant_id, customer_id)
      VALUES ($1,$2)
      ON CONFLICT (tenant_id, customer_id)
      DO UPDATE SET updated_at = now()
      RETURNING id, customer_id, state, lock_version, lease_owner, lease_expires_at, lease_token,
-               service_id, clarify_count, current_offer_set_id, pending_appointment_id`,
+               service_id, clarify_count, current_offer_set_id, pending_appointment_id, pending_request`,
     [tenantId, customerId],
   );
   return r.rows[0]!;
@@ -203,6 +204,7 @@ export async function lockConversationLease(
   const r = await client.query<{ lock_version: number }>(
     `SELECT lock_version FROM conversations
      WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4
+       AND lease_expires_at IS NOT NULL AND lease_expires_at > now()
      FOR UPDATE`,
     [tenantId, conversationId, leaseToken, lockVersion],
   );
@@ -220,6 +222,7 @@ export async function updateConversationState(
     serviceId?: string | null;
     pendingAppointmentId?: string | null;
     currentOfferSetId?: string | null;
+    pendingRequest?: unknown;
     clarifyCount?: number;
   },
 ) {
@@ -229,9 +232,11 @@ export async function updateConversationState(
          service_id = $6,
          pending_appointment_id = $7,
          current_offer_set_id = $8,
+         pending_request = $10::jsonb,
          clarify_count = COALESCE($9, clarify_count),
          updated_at = now()
-     WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4`,
+     WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4
+       AND lease_expires_at IS NOT NULL AND lease_expires_at > now()`,
     [
       tenantId,
       conversationId,
@@ -242,6 +247,7 @@ export async function updateConversationState(
       patch.pendingAppointmentId ?? null,
       patch.currentOfferSetId ?? null,
       patch.clarifyCount ?? null,
+      patch.pendingRequest == null ? null : JSON.stringify(patch.pendingRequest),
     ],
   );
   return (r.rowCount ?? 0) === 1;
@@ -635,19 +641,31 @@ export async function consumeLlmBudgetWindow(
      VALUES ($1, $2, 'sender_minute', $3, 1)
      ON CONFLICT (tenant_id, subject_key, window_kind, window_start)
      DO UPDATE SET hit_count = llm_budget_windows.hit_count + 1
+     WHERE llm_budget_windows.hit_count < $4
      RETURNING hit_count`,
-    [tenantId, senderSubject, minuteStart],
+    [tenantId, senderSubject, minuteStart, senderPerMinute],
   );
+  if (!sender.rows[0]) {
+    return false;
+  }
   const tenant = await client.query<{ hit_count: number }>(
     `INSERT INTO llm_budget_windows (tenant_id, subject_key, window_kind, window_start, hit_count)
      VALUES ($1, 'tenant', 'tenant_hour', $2, 1)
      ON CONFLICT (tenant_id, subject_key, window_kind, window_start)
      DO UPDATE SET hit_count = llm_budget_windows.hit_count + 1
+     WHERE llm_budget_windows.hit_count < $3
      RETURNING hit_count`,
-    [tenantId, hourStart],
+    [tenantId, hourStart, tenantPerHour],
   );
-  return (
-    (sender.rows[0]?.hit_count ?? 0) <= senderPerMinute &&
-    (tenant.rows[0]?.hit_count ?? 0) <= tenantPerHour
-  );
+  if (!tenant.rows[0]) {
+    await client.query(
+      `UPDATE llm_budget_windows
+       SET hit_count = hit_count - 1
+       WHERE tenant_id = $1 AND subject_key = $2 AND window_kind = 'sender_minute'
+         AND window_start = $3 AND hit_count > 0`,
+      [tenantId, senderSubject, minuteStart],
+    );
+    return false;
+  }
+  return true;
 }

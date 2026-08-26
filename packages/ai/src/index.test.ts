@@ -46,4 +46,18 @@ describe("FakeAIProvider", () => {
     expect(parsed.intent).toBe("SELECT_SERVICE");
     expect(parsed.ordinal).toBe(1);
   });
+
+  it("maps Thursday morning with a staff preference", async () => {
+    const ai = new FakeAIProvider();
+    const parsed = IntentSchema.parse(
+      await ai.extractIntent({
+        userText: "יש אצל דניאל בחמישי בבוקר?",
+        context: ctx,
+      }),
+    );
+    expect(parsed.intent).toBe("FIND_AVAILABILITY");
+    expect(parsed.weekday).toBe("THU");
+    expect(parsed.time_window).toBe("MORNING");
+    expect(parsed.staff_name).toBe("Daniel");
+  });
 });

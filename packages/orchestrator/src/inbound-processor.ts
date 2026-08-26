@@ -12,10 +12,12 @@ import {
 } from "@tavo/security";
 import type { Clock, TrustedTenantContext } from "@tavo/shared";
 import {
+  DomainError,
   Errors,
   INBOUND_MAX_ATTEMPTS,
   LEASE_TTL_SECONDS,
   ORCHESTRATOR_DEADLINE_MS,
+  isExclusionViolation,
   retryBackoffSeconds,
 } from "@tavo/shared";
 import {
@@ -48,18 +50,28 @@ import {
   FakeAIProvider,
   IntentSchema,
   MinContextSchema,
+  PendingRequestSchema,
+  mergePendingRequest,
   type AIProvider,
   type MinContext,
+  type PendingRequest,
   type StructuredIntent,
 } from "@tavo/ai";
 import { consumeLlmBudget, LLM_BUDGET_HE } from "./llm-budget";
 import {
+  AMBIGUOUS_SERVICE_HE,
+  AMBIGUOUS_STAFF_HE,
   CANCELLED_HE,
+  CLARIFY_SERVICE_HE,
+  CLARIFY_STAFF_HE,
   FALLBACK_HE,
+  SLOT_UNAVAILABLE_HE,
+  formatAppointmentOptionLabel,
   formatAvailabilityList,
   formatBookingConfirmation,
   formatBookingsList,
   formatBusinessInfo,
+  formatOfferedOptionLabel,
   formatPrices,
   formatRescheduleConfirmation,
   formatServiceChoices,
@@ -89,6 +101,7 @@ type Plan = {
   serviceId: string | null;
   pendingAppointmentId: string | null;
   offerSetId: string | null;
+  pendingRequest: PendingRequest | null;
   offered?: Offered[];
   book?: { slotRef: string };
   cancelId?: string;
@@ -104,17 +117,47 @@ type Snapshot = {
   appts: { id: string; staff_id: string; service_id: string; start_at: Date; customer_id: string }[];
 };
 
+type Prepared = {
+  customerId: string;
+  conversationId: string;
+  lockVersion: number;
+  leaseToken: string;
+  text: string;
+  integrationId: string;
+  inboundId: string;
+  attemptCount: number;
+  state: string;
+  serviceId: string | null;
+  pendingAppointmentId: string | null;
+  currentOfferSetId: string | null;
+  pendingRequest: PendingRequest | null;
+};
+
 function newSlotRef(): string {
   return `slot_${randomBytes(16).toString("base64url")}`;
 }
 
-function matchService(
-  services: { id: string; name: string }[],
+function parsePending(raw: unknown): PendingRequest | null {
+  const parsed = PendingRequestSchema.safeParse(raw ?? {});
+  if (!parsed.success) return null;
+  return Object.keys(parsed.data).length ? parsed.data : null;
+}
+
+function resolveByName<T extends { name: string }>(
+  items: T[],
   hint?: string,
-): { id: string; name: string } | undefined {
-  if (!hint) return undefined;
+): { ok: T } | { fail: "unknown" | "ambiguous" } | { skip: true } {
+  if (!hint?.trim()) return { skip: true };
   const n = hint.trim().toLowerCase();
-  return services.find((s) => s.name.toLowerCase() === n || s.name.toLowerCase().includes(n));
+  const exact = items.filter((s) => s.name.toLowerCase() === n);
+  if (exact.length === 1) return { ok: exact[0]! };
+  if (exact.length > 1) return { fail: "ambiguous" };
+  const partial = items.filter(
+    (s) => s.name.toLowerCase().includes(n) || n.includes(s.name.toLowerCase()),
+  );
+  if (partial.length === 1) return { ok: partial[0]! };
+  if (partial.length > 1) return { fail: "ambiguous" };
+  return { fail: "unknown" };
 }
 
 function idlePlan(facts: string, intent: string): Plan {
@@ -124,8 +167,23 @@ function idlePlan(facts: string, intent: string): Plan {
     serviceId: null,
     pendingAppointmentId: null,
     offerSetId: null,
+    pendingRequest: null,
     intent,
   };
+}
+
+function isStaleOfferedSlot(err: unknown): boolean {
+  if (isExclusionViolation(err)) return true;
+  if (err instanceof DomainError) {
+    if (err.code === "SLOT_NO_LONGER_AVAILABLE") return true;
+    if (
+      err.code === "VALIDATION" &&
+      /unknown slot|slot expired|slot already used/.test(err.message)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export class InboundProcessor {
@@ -222,7 +280,8 @@ export class InboundProcessor {
         serviceId: conversation.service_id,
         pendingAppointmentId: conversation.pending_appointment_id,
         currentOfferSetId: conversation.current_offer_set_id,
-      };
+        pendingRequest: parsePending(conversation.pending_request),
+      } satisfies Prepared;
     });
     if (!prepared) return;
 
@@ -262,109 +321,111 @@ export class InboundProcessor {
 
     try {
       await withTenant(this.pool, tenantId, async (client) => {
-      if (this.failNextApply) {
-        this.failNextApply = false;
-        throw new Error("test apply failure");
-      }
-      const still = await lockConversationLease(
-        client,
-        tenantId,
-        prepared.conversationId,
-        prepared.leaseToken,
-        prepared.lockVersion,
-      );
-      if (!still) {
-        await markInboundFailed(client, tenantId, jobId, "lost lease", 5, INBOUND_MAX_ATTEMPTS);
-        return;
-      }
-      if (plan.offered && plan.offerSetId) {
-        await insertOfferedSlots(client, tenantId, prepared.conversationId, plan.offerSetId, plan.offered);
-      }
-      if (plan.book) {
-        await this.appointments.bookFromOfferedSlot(client, ctx, {
+        if (this.failNextApply) {
+          this.failNextApply = false;
+          throw new Error("test apply failure");
+        }
+        const still = await lockConversationLease(
+          client,
+          tenantId,
+          prepared.conversationId,
+          prepared.leaseToken,
+          prepared.lockVersion,
+        );
+        if (!still) {
+          await markInboundFailed(client, tenantId, jobId, "lost lease", 5, INBOUND_MAX_ATTEMPTS);
+          return;
+        }
+        if (plan.book || plan.rescheduleFromSlot) {
+          await client.query("SAVEPOINT slot_mutate");
+          try {
+            if (plan.book) {
+              await this.appointments.bookFromOfferedSlot(client, ctx, {
+                conversationId: prepared.conversationId,
+                slotRef: plan.book.slotRef,
+                customerId: prepared.customerId,
+                inboundEventId: prepared.inboundId,
+                commandKey: `create:${prepared.inboundId}`,
+              });
+            }
+            if (plan.rescheduleFromSlot) {
+              await this.appointments.rescheduleFromOfferedSlot(client, ctx, {
+                conversationId: prepared.conversationId,
+                slotRef: plan.rescheduleFromSlot.slotRef,
+                customerId: prepared.customerId,
+                inboundEventId: prepared.inboundId,
+                commandKey: `reschedule:${prepared.inboundId}`,
+                appointmentId: plan.rescheduleFromSlot.appointmentId,
+              });
+            }
+          } catch (e) {
+            await client.query("ROLLBACK TO SAVEPOINT slot_mutate");
+            if (!isStaleOfferedSlot(e)) throw e;
+            plan = await this.planStaleSlotRecovery(ctx, prepared, plan);
+          }
+        }
+        if (plan.offered && plan.offerSetId) {
+          await insertOfferedSlots(client, tenantId, prepared.conversationId, plan.offerSetId, plan.offered);
+        }
+        const wroteState = await updateConversationState(
+          client,
+          tenantId,
+          prepared.conversationId,
+          prepared.leaseToken,
+          prepared.lockVersion,
+          {
+            state: plan.state,
+            serviceId: plan.serviceId,
+            pendingAppointmentId: plan.pendingAppointmentId,
+            currentOfferSetId: plan.offerSetId,
+            pendingRequest: plan.pendingRequest,
+          },
+        );
+        if (!wroteState) {
+          await markInboundFailed(client, tenantId, jobId, "lost lease", 5, INBOUND_MAX_ATTEMPTS);
+          return;
+        }
+        const enc = encryptUtf8(plan.facts, this.messageKey(), this.messages.writeVersion);
+        const inboundEnc = encryptUtf8(prepared.text, this.messageKey(), this.messages.writeVersion);
+        await insertChatMessage(client, tenantId, {
           conversationId: prepared.conversationId,
-          slotRef: plan.book.slotRef,
-          customerId: prepared.customerId,
+          direction: "INBOUND",
+          bodyEncrypted: inboundEnc.ciphertext,
+          messageEncryptionKeyVersion: inboundEnc.version,
           inboundEventId: prepared.inboundId,
-          commandKey: `create:${prepared.inboundId}`,
         });
-      }
-      if (plan.cancelId) {
-        await this.appointments.cancelOnClient(client, ctx, plan.cancelId, {
-          commandKey: `cancel:${prepared.inboundId}`,
-          inboundEventId: prepared.inboundId,
+        const out = await insertOutboundMessage(client, tenantId, {
           customerId: prepared.customerId,
-          notBefore: this.clock.now(),
-        });
-      }
-      if (plan.rescheduleFromSlot) {
-        await this.appointments.rescheduleFromOfferedSlot(client, ctx, {
+          integrationId: prepared.integrationId,
           conversationId: prepared.conversationId,
-          slotRef: plan.rescheduleFromSlot.slotRef,
-          customerId: prepared.customerId,
-          inboundEventId: prepared.inboundId,
-          commandKey: `reschedule:${prepared.inboundId}`,
-          appointmentId: plan.rescheduleFromSlot.appointmentId,
+          causedByInboundEventId: prepared.inboundId,
+          bodyEncrypted: enc.ciphertext,
+          messageEncryptionKeyVersion: enc.version,
         });
-      }
-      const wroteState = await updateConversationState(
-        client,
-        tenantId,
-        prepared.conversationId,
-        prepared.leaseToken,
-        prepared.lockVersion,
-        {
-          state: plan.state,
-          serviceId: plan.serviceId,
-          pendingAppointmentId: plan.pendingAppointmentId,
-          currentOfferSetId: plan.offerSetId,
-        },
-      );
-      if (!wroteState) {
-        await markInboundFailed(client, tenantId, jobId, "lost lease", 5, INBOUND_MAX_ATTEMPTS);
-        return;
-      }
-      const enc = encryptUtf8(plan.facts, this.messageKey(), this.messages.writeVersion);
-      const inboundEnc = encryptUtf8(prepared.text, this.messageKey(), this.messages.writeVersion);
-      await insertChatMessage(client, tenantId, {
-        conversationId: prepared.conversationId,
-        direction: "INBOUND",
-        bodyEncrypted: inboundEnc.ciphertext,
-        messageEncryptionKeyVersion: inboundEnc.version,
-        inboundEventId: prepared.inboundId,
+        await insertChatMessage(client, tenantId, {
+          conversationId: prepared.conversationId,
+          direction: "OUTBOUND",
+          bodyEncrypted: enc.ciphertext,
+          messageEncryptionKeyVersion: enc.version,
+          outboundId: out.id,
+        });
+        await insertAudit(client, ctx.tenantId, {
+          actorType: ctx.actorType,
+          actorId: ctx.actorId,
+          action: "conversation.turn",
+          objectType: "conversation",
+          objectId: prepared.conversationId,
+          metadata: { intent: plan.intent ?? "UNKNOWN", inboundEventId: prepared.inboundId },
+        });
+        await markInboundProcessed(client, tenantId, jobId);
+        await releaseConversationLease(
+          client,
+          tenantId,
+          prepared.conversationId,
+          prepared.leaseToken,
+          prepared.lockVersion,
+        );
       });
-      const out = await insertOutboundMessage(client, tenantId, {
-        customerId: prepared.customerId,
-        integrationId: prepared.integrationId,
-        conversationId: prepared.conversationId,
-        causedByInboundEventId: prepared.inboundId,
-        bodyEncrypted: enc.ciphertext,
-        messageEncryptionKeyVersion: enc.version,
-      });
-      await insertChatMessage(client, tenantId, {
-        conversationId: prepared.conversationId,
-        direction: "OUTBOUND",
-        bodyEncrypted: enc.ciphertext,
-        messageEncryptionKeyVersion: enc.version,
-        outboundId: out.id,
-      });
-      await insertAudit(client, tenantId, {
-        actorType: ctx.actorType,
-        actorId: ctx.actorId,
-        action: "conversation.turn",
-        objectType: "conversation",
-        objectId: prepared.conversationId,
-        metadata: { intent: plan.intent ?? "UNKNOWN", inboundEventId: prepared.inboundId },
-      });
-      await markInboundProcessed(client, tenantId, jobId);
-      await releaseConversationLease(
-        client,
-        tenantId,
-        prepared.conversationId,
-        prepared.leaseToken,
-        prepared.lockVersion,
-      );
-    });
     } catch (e) {
       await withTenant(this.pool, tenantId, async (client) => {
         await markInboundFailed(
@@ -392,20 +453,64 @@ export class InboundProcessor {
     return k;
   }
 
-  private async plan(
+  private async planStaleSlotRecovery(
     ctx: TrustedTenantContext,
-    prepared: {
-      customerId: string;
-      conversationId: string;
-      text: string;
-      inboundId: string;
-      state: string;
-      serviceId: string | null;
-      pendingAppointmentId: string | null;
-      currentOfferSetId: string | null;
-    },
-    signal: AbortSignal,
+    prepared: Prepared,
+    failed: Plan,
   ): Promise<Plan> {
+    const serviceId = failed.serviceId ?? prepared.serviceId;
+    const pending = failed.pendingRequest ?? prepared.pendingRequest;
+    const reschedule = prepared.state === "AWAITING_RESCHEDULE_SLOT";
+    if (!serviceId) {
+      return {
+        ...idlePlan(`${SLOT_UNAVAILABLE_HE} ${FALLBACK_HE}`, failed.intent ?? "SELECT_SLOT"),
+        facts: `${SLOT_UNAVAILABLE_HE} ${FALLBACK_HE}`,
+      };
+    }
+    const snap = await withTenant(this.pool, ctx.tenantId, async (c) => {
+      const business = await getBusiness(c, ctx.tenantId);
+      const services = await listServices(c, ctx.tenantId);
+      const staff = await listStaffNames(c, ctx.tenantId);
+      return { business, services, staff, open: [], appts: [] as Snapshot["appts"] };
+    });
+    if (!snap.business) {
+      return idlePlan(`${SLOT_UNAVAILABLE_HE} ${FALLBACK_HE}`, "SELECT_SLOT");
+    }
+    const offered = await this.planAvailability(
+      ctx,
+      {
+        conversationId: prepared.conversationId,
+        serviceId,
+        pendingAppointmentId: failed.pendingAppointmentId ?? prepared.pendingAppointmentId,
+        pendingRequest: pending,
+      },
+      {
+        intent: "FIND_AVAILABILITY",
+        confidence: 1,
+        ...pending,
+      },
+      { ...snap, business: snap.business, open: [], appts: [] },
+    );
+    const prefix = SLOT_UNAVAILABLE_HE;
+    if (!offered.offered?.length) {
+      return {
+        ...idlePlan(`${prefix} ${FALLBACK_HE}`, "SELECT_SLOT"),
+        facts: `${prefix} ${FALLBACK_HE}`,
+      };
+    }
+    return {
+      ...offered,
+      facts: `${prefix}\n${offered.facts}`,
+      state: reschedule ? "AWAITING_RESCHEDULE_SLOT" : "OFFERING_SLOTS",
+      pendingAppointmentId: reschedule
+        ? (failed.pendingAppointmentId ?? prepared.pendingAppointmentId)
+        : null,
+      pendingRequest: pending,
+      intent: reschedule ? "RESCHEDULE_BOOKING" : "FIND_AVAILABILITY",
+    };
+  }
+
+  private async plan(ctx: TrustedTenantContext, prepared: Prepared, signal: AbortSignal): Promise<Plan> {
     const snapshot = await withTenant(this.pool, ctx.tenantId, async (client) => {
       const allowed = await consumeLlmBudget(client, ctx.tenantId, prepared.customerId, this.clock.now());
       const business = await getBusiness(client, ctx.tenantId);
@@ -438,6 +543,7 @@ export class InboundProcessor {
         serviceId: prepared.serviceId,
         pendingAppointmentId: prepared.pendingAppointmentId,
         offerSetId: prepared.currentOfferSetId,
+        pendingRequest: prepared.pendingRequest,
         intent: "UNKNOWN",
       };
     }
@@ -455,9 +561,25 @@ export class InboundProcessor {
         ? {
             offered_options: snapshot.open.map((o) => ({
               ordinal: o.ordinal,
-              label: DateTime.fromJSDate(o.start_at, { zone: "utc" })
-                .setZone(snapshot.business!.timezone)
-                .toFormat("HH:mm"),
+              label: formatOfferedOptionLabel(
+                o.start_at,
+                snapshot.staff.find((s) => s.id === o.staff_id)?.name ?? "",
+                snapshot.business!.timezone,
+              ),
+            })),
+          }
+        : {}),
+      ...(prepared.state === "AWAITING_CANCEL_CONFIRM" ||
+      prepared.state === "AWAITING_RESCHEDULE_APPOINTMENT"
+        ? {
+            appointment_options: snapshot.appts.map((a, i) => ({
+              ordinal: i + 1,
+              label: formatAppointmentOptionLabel({
+                startAt: a.start_at,
+                serviceName: snapshot.services.find((s) => s.id === a.service_id)?.name ?? "",
+                staffName: snapshot.staff.find((s) => s.id === a.staff_id)?.name ?? "",
+                timeZone: snapshot.business!.timezone,
+              }),
             })),
           }
         : {}),
@@ -491,6 +613,7 @@ export class InboundProcessor {
         serviceId: prepared.serviceId,
         pendingAppointmentId: prepared.pendingAppointmentId,
         offerSetId: prepared.currentOfferSetId,
+        pendingRequest: prepared.pendingRequest,
         intent: parsed.intent,
       };
     }
@@ -501,14 +624,15 @@ export class InboundProcessor {
         serviceId: prepared.serviceId,
         pendingAppointmentId: prepared.pendingAppointmentId,
         offerSetId: prepared.currentOfferSetId,
+        pendingRequest: prepared.pendingRequest,
         intent: parsed.intent,
       };
     }
     if (parsed.intent === "GET_BOOKING") {
-      return this.planListBookings(ctx, prepared, snap, parsed.intent);
+      return this.planListBookings(prepared, snap, parsed.intent);
     }
     if (parsed.intent === "CANCEL_BOOKING" || prepared.state === "AWAITING_CANCEL_CONFIRM") {
-      return this.planCancel(ctx, prepared, parsed, snap);
+      return this.planCancel(prepared, parsed, snap);
     }
     if (
       parsed.intent === "RESCHEDULE_BOOKING" ||
@@ -528,52 +652,51 @@ export class InboundProcessor {
         return idlePlan(FALLBACK_HE, parsed.intent);
       }
       if (prepared.state === "AWAITING_RESCHEDULE_SLOT") {
-        return this.planRescheduleSelect(ctx, prepared, parsed, snap);
+        return this.planRescheduleSelect(prepared, parsed, snap);
       }
       return this.planSelectConfirm(ctx, prepared, parsed, snap);
     }
     return idlePlan(FALLBACK_HE, parsed.intent);
   }
 
-  private async planListBookings(
-    ctx: TrustedTenantContext,
-    prepared: {
-      serviceId: string | null;
-      pendingAppointmentId: string | null;
-      state: string;
-      currentOfferSetId: string | null;
-    },
-    snap: Snapshot,
-    intent: string,
-  ): Promise<Plan> {
-    const rows = [];
-    for (const a of snap.appts) {
-      const staff = snap.staff.find((s) => s.id === a.staff_id);
-      rows.push({
-        startAt: a.start_at,
-        serviceName: snap.services.find((s) => s.id === a.service_id)?.name ?? "",
-        staffName: staff?.name ?? "",
-      });
-    }
+  private planListBookings(prepared: Prepared, snap: Snapshot, intent: string): Plan {
+    const rows = snap.appts.map((a) => ({
+      startAt: a.start_at,
+      serviceName: snap.services.find((s) => s.id === a.service_id)?.name ?? "",
+      staffName: snap.staff.find((s) => s.id === a.staff_id)?.name ?? "",
+    }));
     return {
       facts: formatBookingsList(rows, snap.business.timezone),
       state: prepared.state,
       serviceId: prepared.serviceId,
       pendingAppointmentId: prepared.pendingAppointmentId,
       offerSetId: prepared.currentOfferSetId,
+      pendingRequest: prepared.pendingRequest,
       intent,
     };
   }
 
   private async planServiceSelect(
     ctx: TrustedTenantContext,
-    prepared: { conversationId: string; serviceId: string | null },
+    prepared: Prepared,
     parsed: StructuredIntent,
     snap: Snapshot,
   ): Promise<Plan> {
-    const byName = matchService(snap.services, parsed.service_name);
+    const pending = mergePendingRequest(prepared.pendingRequest, parsed);
+    const named = resolveByName(snap.services, parsed.service_name);
+    if ("fail" in named) {
+      return {
+        facts: `${named.fail === "ambiguous" ? AMBIGUOUS_SERVICE_HE : CLARIFY_SERVICE_HE}\n${formatServiceChoices(snap.services)}`,
+        state: "AWAITING_SERVICE",
+        serviceId: null,
+        pendingAppointmentId: null,
+        offerSetId: null,
+        pendingRequest: pending,
+        intent: "SELECT_SERVICE",
+      };
+    }
     const byOrdinal = parsed.ordinal ? snap.services[parsed.ordinal - 1] : undefined;
-    const service = byName ?? byOrdinal;
+    const service = "ok" in named ? named.ok : byOrdinal;
     if (!service) {
       return {
         facts: formatServiceChoices(snap.services),
@@ -581,12 +704,13 @@ export class InboundProcessor {
         serviceId: null,
         pendingAppointmentId: null,
         offerSetId: null,
+        pendingRequest: pending,
         intent: "SELECT_SERVICE",
       };
     }
     return this.planAvailability(
       ctx,
-      { conversationId: prepared.conversationId, serviceId: service.id },
+      { ...prepared, serviceId: service.id, pendingRequest: pending },
       { ...parsed, intent: "FIND_AVAILABILITY", confidence: 1, service_name: service.name },
       snap,
     );
@@ -594,52 +718,76 @@ export class InboundProcessor {
 
   private async planAvailability(
     ctx: TrustedTenantContext,
-    prepared: { conversationId: string; serviceId: string | null },
+    prepared: {
+      conversationId: string;
+      serviceId: string | null;
+      pendingAppointmentId?: string | null;
+      pendingRequest?: PendingRequest | null;
+    },
     parsed: StructuredIntent,
     snap: Snapshot,
   ): Promise<Plan> {
-    const hinted = matchService(snap.services, parsed.service_name);
+    const pending = mergePendingRequest(prepared.pendingRequest, parsed);
+    const named = resolveByName(snap.services, parsed.service_name);
+    if ("fail" in named) {
+      return {
+        facts: `${named.fail === "ambiguous" ? AMBIGUOUS_SERVICE_HE : CLARIFY_SERVICE_HE}\n${formatServiceChoices(snap.services)}`,
+        state: "AWAITING_SERVICE",
+        serviceId: null,
+        pendingAppointmentId: prepared.pendingAppointmentId ?? null,
+        offerSetId: null,
+        pendingRequest: pending,
+        intent: "FIND_AVAILABILITY",
+      };
+    }
     const only = snap.services.length === 1 ? snap.services[0] : undefined;
     const remembered =
       snap.services.length === 1 ? only : snap.services.find((s) => s.id === prepared.serviceId);
-    const service = hinted ?? remembered ?? only;
+    const service = ("ok" in named ? named.ok : undefined) ?? remembered ?? only;
     if (!service) {
       return {
         facts: formatServiceChoices(snap.services),
         state: "AWAITING_SERVICE",
         serviceId: null,
-        pendingAppointmentId: null,
+        pendingAppointmentId: prepared.pendingAppointmentId ?? null,
         offerSetId: null,
+        pendingRequest: pending,
         intent: "FIND_AVAILABILITY",
       };
     }
-    const staffHint = parsed.staff_name
-      ? snap.staff.find(
-          (s) =>
-            s.name.toLowerCase() === parsed.staff_name!.toLowerCase() ||
-            s.name.toLowerCase().includes(parsed.staff_name!.toLowerCase()),
-        )
-      : undefined;
-    const { from, to } = civilWindow(
-      this.clock.now(),
-      snap.business.timezone,
-      parsed.relative_when ?? "TOMORROW",
-      parsed.time_window ?? "EVENING",
-      {
-        ...(parsed.civil_date ? { civilDate: parsed.civil_date } : {}),
-        ...(parsed.weekday ? { weekday: parsed.weekday } : {}),
-        ...(parsed.time_exact ? { timeExact: parsed.time_exact } : {}),
-        ...(parsed.time_from ? { timeFrom: parsed.time_from } : {}),
-        ...(parsed.time_to ? { timeTo: parsed.time_to } : {}),
-      },
-    );
+    const staffHintName = parsed.staff_name ?? pending?.staff_name;
+    const staffResolved = resolveByName(snap.staff, staffHintName);
+    if ("fail" in staffResolved) {
+      return {
+        facts: staffResolved.fail === "ambiguous" ? AMBIGUOUS_STAFF_HE : CLARIFY_STAFF_HE,
+        state: prepared.serviceId ? "AWAITING_SERVICE" : "IDLE",
+        serviceId: null,
+        pendingAppointmentId: null,
+        offerSetId: null,
+        pendingRequest: pending,
+        intent: "FIND_AVAILABILITY",
+      };
+    }
+    const staffHint = "ok" in staffResolved ? staffResolved.ok : undefined;
+    const relative = pending?.relative_when ?? parsed.relative_when ?? "TOMORROW";
+    const window = pending?.time_window ?? parsed.time_window ?? "EVENING";
+    const bounds = civilWindow(this.clock.now(), snap.business.timezone, relative, window, {
+      ...(pending?.civil_date ? { civilDate: pending.civil_date } : {}),
+      ...(pending?.weekday ? { weekday: pending.weekday } : {}),
+      ...(pending?.time_exact ? { timeExact: pending.time_exact } : {}),
+      ...(pending?.time_from ? { timeFrom: pending.time_from } : {}),
+      ...(pending?.time_to ? { timeTo: pending.time_to } : {}),
+    });
     const slots = await this.scheduling.findAvailableSlots(ctx, {
       serviceId: service.id,
-      from,
-      to,
+      from: bounds.from,
+      to: bounds.to,
       ...(staffHint ? { staffId: staffHint.id } : {}),
     });
-    const capped = slots.slice(0, 5);
+    const matching = slots.filter((s) =>
+      slotInLocalMinutes(s.startAt, snap.business.timezone, bounds.minuteFrom, bounds.minuteTo),
+    );
+    const capped = matching.slice(0, 5);
     if (capped.length === 0) {
       return idlePlan(FALLBACK_HE, "FIND_AVAILABILITY");
     }
@@ -661,8 +809,9 @@ export class InboundProcessor {
       ),
       state: "OFFERING_SLOTS",
       serviceId: service.id,
-      pendingAppointmentId: null,
+      pendingAppointmentId: prepared.pendingAppointmentId ?? null,
       offerSetId,
+      pendingRequest: pending,
       offered,
       intent: "FIND_AVAILABILITY",
     };
@@ -670,7 +819,7 @@ export class InboundProcessor {
 
   private async planSelectConfirm(
     ctx: TrustedTenantContext,
-    prepared: { serviceId: string | null },
+    prepared: Prepared,
     parsed: StructuredIntent,
     snap: Snapshot,
   ): Promise<Plan> {
@@ -696,16 +845,12 @@ export class InboundProcessor {
       serviceId: null,
       pendingAppointmentId: null,
       offerSetId: null,
+      pendingRequest: null,
       intent: parsed.intent,
     };
   }
 
-  private async planCancel(
-    ctx: TrustedTenantContext,
-    prepared: { pendingAppointmentId: string | null; serviceId: string | null; state: string },
-    parsed: StructuredIntent,
-    snap: Snapshot,
-  ): Promise<Plan> {
+  private planCancel(prepared: Prepared, parsed: StructuredIntent, snap: Snapshot): Plan {
     let targetId: string | undefined;
     if (parsed.ordinal && prepared.state === "AWAITING_CANCEL_CONFIRM") {
       targetId = snap.appts[parsed.ordinal - 1]?.id;
@@ -728,6 +873,7 @@ export class InboundProcessor {
         serviceId: null,
         pendingAppointmentId: null,
         offerSetId: null,
+        pendingRequest: prepared.pendingRequest,
         intent: "CANCEL_BOOKING",
       };
     }
@@ -738,24 +884,21 @@ export class InboundProcessor {
       serviceId: null,
       pendingAppointmentId: null,
       offerSetId: null,
+      pendingRequest: null,
       intent: "CANCEL_BOOKING",
     };
   }
 
   private async planReschedule(
     ctx: TrustedTenantContext,
-    prepared: {
-      conversationId: string;
-      serviceId: string | null;
-      pendingAppointmentId: string | null;
-      state: string;
-    },
+    prepared: Prepared,
     parsed: StructuredIntent,
     snap: Snapshot,
   ): Promise<Plan> {
+    const pending = mergePendingRequest(prepared.pendingRequest, parsed);
     if (prepared.state === "AWAITING_RESCHEDULE_SLOT" && SLOT_SELECT_STATES.has(prepared.state)) {
       if (parsed.intent === "SELECT_SLOT" || parsed.intent === "CREATE_BOOKING") {
-        return this.planRescheduleSelect(ctx, prepared, parsed, snap);
+        return this.planRescheduleSelect(prepared, parsed, snap);
       }
     }
     if (prepared.state === "AWAITING_RESCHEDULE_APPOINTMENT" && parsed.ordinal) {
@@ -765,8 +908,18 @@ export class InboundProcessor {
       }
       const offered = await this.planAvailability(
         ctx,
-        { conversationId: prepared.conversationId, serviceId: appt.service_id },
-        { ...parsed, intent: "FIND_AVAILABILITY", confidence: 1, relative_when: parsed.relative_when ?? "THIS_WEEK" },
+        {
+          conversationId: prepared.conversationId,
+          serviceId: appt.service_id,
+          pendingAppointmentId: appt.id,
+          pendingRequest: pending,
+        },
+        {
+          ...parsed,
+          intent: "FIND_AVAILABILITY",
+          confidence: 1,
+          relative_when: pending?.relative_when ?? parsed.relative_when ?? "THIS_WEEK",
+        },
         snap,
       );
       return {
@@ -774,6 +927,7 @@ export class InboundProcessor {
         state: "AWAITING_RESCHEDULE_SLOT",
         pendingAppointmentId: appt.id,
         serviceId: appt.service_id,
+        pendingRequest: pending,
         intent: "RESCHEDULE_BOOKING",
       };
     }
@@ -792,14 +946,25 @@ export class InboundProcessor {
         serviceId: null,
         pendingAppointmentId: null,
         offerSetId: null,
+        pendingRequest: pending,
         intent: "RESCHEDULE_BOOKING",
       };
     }
     const appt = snap.appts[0]!;
     const offered = await this.planAvailability(
       ctx,
-      { conversationId: prepared.conversationId, serviceId: appt.service_id },
-        { ...parsed, intent: "FIND_AVAILABILITY", confidence: 1, relative_when: parsed.relative_when ?? "THIS_WEEK" },
+      {
+        conversationId: prepared.conversationId,
+        serviceId: appt.service_id,
+        pendingAppointmentId: appt.id,
+        pendingRequest: pending,
+      },
+      {
+        ...parsed,
+        intent: "FIND_AVAILABILITY",
+        confidence: 1,
+        relative_when: pending?.relative_when ?? parsed.relative_when ?? "THIS_WEEK",
+      },
       snap,
     );
     return {
@@ -807,16 +972,12 @@ export class InboundProcessor {
       state: "AWAITING_RESCHEDULE_SLOT",
       pendingAppointmentId: appt.id,
       serviceId: appt.service_id,
+      pendingRequest: pending,
       intent: "RESCHEDULE_BOOKING",
     };
   }
 
-  private async planRescheduleSelect(
-    ctx: TrustedTenantContext,
-    prepared: { pendingAppointmentId: string | null; serviceId: string | null },
-    parsed: StructuredIntent,
-    snap: Snapshot,
-  ): Promise<Plan> {
+  private planRescheduleSelect(prepared: Prepared, parsed: StructuredIntent, snap: Snapshot): Plan {
     const match =
       (parsed.slot_ref ? snap.open.find((s) => s.slot_ref === parsed.slot_ref) : undefined) ??
       (parsed.ordinal ? snap.open.find((s) => s.ordinal === parsed.ordinal) : undefined);
@@ -828,6 +989,7 @@ export class InboundProcessor {
         pendingAppointmentId: appointmentId,
         serviceId: prepared.serviceId,
         offerSetId: null,
+        pendingRequest: prepared.pendingRequest,
         intent: parsed.intent,
       };
     }
@@ -845,6 +1007,7 @@ export class InboundProcessor {
       serviceId: null,
       pendingAppointmentId: null,
       offerSetId: null,
+      pendingRequest: null,
       intent: parsed.intent,
     };
   }
@@ -860,7 +1023,40 @@ const WEEKDAY_LUXON: Record<"SUN" | "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT
   SUN: 7,
 };
 
-/** WhatsApp GET/CANCEL/RESCHEDULE only include CONFIRMED appointments with start_at > trusted now. */
+const WINDOW_MINUTES = {
+  MORNING: [9 * 60, 12 * 60] as const,
+  AFTERNOON: [12 * 60, 17 * 60] as const,
+  EVENING: [17 * 60, 21 * 60] as const,
+};
+
+function parseHm(value: string): number {
+  const [h, m] = value.split(":").map(Number);
+  return (h ?? 0) * 60 + (m ?? 0);
+}
+
+/** Israeli civil week for the pilot: Sunday 00:00 through Saturday end-of-day in the business timezone. */
+export function israeliWeekBounds(localNow: DateTime): { start: DateTime; end: DateTime } {
+  const daysFromSunday = localNow.weekday === 7 ? 0 : localNow.weekday;
+  const start = localNow.startOf("day").minus({ days: daysFromSunday });
+  const end = start.plus({ days: 6 }).endOf("day");
+  return { start, end };
+}
+
+export function slotInLocalMinutes(
+  startAt: Date,
+  timeZone: string,
+  minuteFrom: number,
+  minuteTo: number,
+): boolean {
+  const local = DateTime.fromJSDate(startAt, { zone: "utc" }).setZone(timeZone);
+  const mins = local.hour * 60 + local.minute;
+  return mins >= minuteFrom && mins < minuteTo;
+}
+
+/**
+ * WhatsApp GET/CANCEL/RESCHEDULE only include CONFIRMED appointments with start_at > trusted now.
+ * THIS_WEEK is the remaining Israeli week (Sunday–Saturday) and still applies the time-of-day band.
+ */
 export function civilWindow(
   now: Date,
   timeZone: string,
@@ -873,38 +1069,66 @@ export function civilWindow(
     timeFrom?: string;
     timeTo?: string;
   },
-): { from: Date; to: Date } {
+): { from: Date; to: Date; minuteFrom: number; minuteTo: number } {
   const localNow = DateTime.fromJSDate(now, { zone: "utc" }).setZone(timeZone);
-  if (relative === "THIS_WEEK" && !extra?.civilDate && !extra?.weekday) {
-    return { from: localNow.toUTC().toJSDate(), to: localNow.endOf("week").toUTC().toJSDate() };
+  let minuteFrom = WINDOW_MINUTES[window][0];
+  let minuteTo = WINDOW_MINUTES[window][1];
+  if (extra?.timeExact) {
+    minuteFrom = parseHm(extra.timeExact);
+    minuteTo = minuteFrom + 30;
+  } else {
+    if (extra?.timeFrom) minuteFrom = Math.max(minuteFrom, parseHm(extra.timeFrom));
+    if (extra?.timeTo) minuteTo = Math.min(minuteTo, parseHm(extra.timeTo));
   }
-  let day = localNow.startOf("day");
+  if (minuteTo <= minuteFrom) {
+    const empty = localNow.toUTC().toJSDate();
+    return { from: empty, to: empty, minuteFrom, minuteTo };
+  }
+
+  const atMinutes = (day: DateTime, minutes: number) =>
+    day.startOf("day").plus({ minutes });
+
   if (extra?.civilDate) {
-    day = DateTime.fromISO(extra.civilDate, { zone: timeZone }).startOf("day");
-  } else if (extra?.weekday) {
+    const day = DateTime.fromISO(extra.civilDate, { zone: timeZone }).startOf("day");
+    let from = atMinutes(day, minuteFrom);
+    const to = atMinutes(day, minuteTo);
+    if (from < localNow) from = localNow;
+    return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate(), minuteFrom, minuteTo };
+  }
+
+  const week = israeliWeekBounds(localNow);
+
+  if (extra?.weekday) {
     const target = WEEKDAY_LUXON[extra.weekday];
+    let day = week.start;
     while (day.weekday !== target) {
       day = day.plus({ days: 1 });
     }
-    if (day < localNow.startOf("day")) {
-      day = day.plus({ weeks: 1 });
+    if (day.endOf("day") < localNow) {
+      const empty = localNow.toUTC().toJSDate();
+      return { from: empty, to: empty, minuteFrom, minuteTo };
     }
-  } else if (relative === "TOMORROW") {
+    let from = atMinutes(day, minuteFrom);
+    const to = atMinutes(day, minuteTo);
+    if (from < localNow) from = localNow;
+    return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate(), minuteFrom, minuteTo };
+  }
+
+  if (relative === "THIS_WEEK") {
+    return {
+      from: localNow.toUTC().toJSDate(),
+      to: week.end.toUTC().toJSDate(),
+      minuteFrom,
+      minuteTo,
+    };
+  }
+
+  let day = localNow.startOf("day");
+  if (relative === "TOMORROW") {
     day = day.plus({ days: 1 });
   }
-  const hours =
-    window === "MORNING" ? ([9, 12] as const) : window === "AFTERNOON" ? ([12, 17] as const) : ([17, 21] as const);
-  let from = day.set({ hour: hours[0], minute: 0, second: 0, millisecond: 0 });
-  let to = day.set({ hour: hours[1], minute: 0, second: 0, millisecond: 0 });
-  if (extra?.timeExact) {
-    const [h, m] = extra.timeExact.split(":").map(Number);
-    from = day.set({ hour: h, minute: m, second: 0, millisecond: 0 });
-    to = from.plus({ minutes: 30 });
-  } else if (extra?.timeFrom && extra?.timeTo) {
-    const [hf, mf] = extra.timeFrom.split(":").map(Number);
-    const [ht, mt] = extra.timeTo.split(":").map(Number);
-    from = day.set({ hour: hf, minute: mf, second: 0, millisecond: 0 });
-    to = day.set({ hour: ht, minute: mt, second: 0, millisecond: 0 });
-  }
-  return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate() };
+  let from = atMinutes(day, minuteFrom);
+  const to = atMinutes(day, minuteTo);
+  if (from < localNow) from = localNow;
+  return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate(), minuteFrom, minuteTo };
 }

@@ -18,8 +18,12 @@ export const MinContextSchema = z
     services: z.array(z.object({ name: z.string().min(1).max(80) }).strict()).max(40),
     staff: z.array(z.object({ name: z.string().min(1).max(80) }).strict()).max(40),
     offered_options: z
-      .array(z.object({ ordinal: z.number().int().positive(), label: z.string().max(80) }).strict())
+      .array(z.object({ ordinal: z.number().int().positive(), label: z.string().max(120) }).strict())
       .max(10)
+      .optional(),
+    appointment_options: z
+      .array(z.object({ ordinal: z.number().int().positive(), label: z.string().max(120) }).strict())
+      .max(20)
       .optional(),
   })
   .strict();
@@ -58,6 +62,43 @@ export const IntentSchema = z
 
 export type StructuredIntent = z.infer<typeof IntentSchema>;
 
+export const PendingRequestSchema = z
+  .object({
+    civil_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    weekday: z.enum(["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]).optional(),
+    relative_when: z.enum(["TODAY", "TOMORROW", "THIS_WEEK"]).optional(),
+    time_window: z.enum(["MORNING", "AFTERNOON", "EVENING"]).optional(),
+    time_exact: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    time_from: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    time_to: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    staff_name: z.string().min(1).max(80).optional(),
+  })
+  .strict();
+
+export type PendingRequest = z.infer<typeof PendingRequestSchema>;
+
+export function extractPendingRequest(parsed: StructuredIntent): PendingRequest {
+  const next: PendingRequest = {};
+  if (parsed.civil_date) next.civil_date = parsed.civil_date;
+  if (parsed.weekday) next.weekday = parsed.weekday;
+  if (parsed.relative_when) next.relative_when = parsed.relative_when;
+  if (parsed.time_window) next.time_window = parsed.time_window;
+  if (parsed.time_exact) next.time_exact = parsed.time_exact;
+  if (parsed.time_from) next.time_from = parsed.time_from;
+  if (parsed.time_to) next.time_to = parsed.time_to;
+  if (parsed.staff_name) next.staff_name = parsed.staff_name;
+  return next;
+}
+
+export function mergePendingRequest(
+  stored: PendingRequest | null | undefined,
+  parsed: StructuredIntent,
+): PendingRequest | null {
+  const extracted = extractPendingRequest(parsed);
+  const merged = { ...(stored ?? {}), ...extracted };
+  return Object.keys(merged).length ? merged : null;
+}
+
 export type IntentExtractionInput = {
   userText: string;
   context: MinContext;
@@ -83,6 +124,29 @@ async function wait(ms: number, signal?: AbortSignal): Promise<void> {
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function availabilityHints(t: string, context: MinContext): Partial<StructuredIntent> {
+  const hints: Partial<StructuredIntent> = {};
+  if (t.includes("בוקר")) hints.time_window = "MORNING";
+  else if (t.includes("צהריים") || t.includes("אחה")) hints.time_window = "AFTERNOON";
+  else if (t.includes("ערב")) hints.time_window = "EVENING";
+  if (t.includes("חמישי")) hints.weekday = "THU";
+  else if (t.includes("שלישי")) hints.weekday = "TUE";
+  else if (t.includes("רביעי")) hints.weekday = "WED";
+  else if (t.includes("שישי")) hints.weekday = "FRI";
+  else if (t.includes("שבת")) hints.weekday = "SAT";
+  else if (t.includes("יום ראשון") || t.includes("ביום ראשון")) hints.weekday = "SUN";
+  else if (t.includes("יום שני") || t.includes("ביום שני")) hints.weekday = "MON";
+  const staff = context.staff.find(
+    (s) => t.includes(s.name.toLowerCase()) || (s.name.toLowerCase() === "daniel" && t.includes("דניאל")),
+  );
+  if (staff) hints.staff_name = staff.name;
+  const after = t.match(/אחרי\s+(\d{1,2}:\d{2})/) ?? t.match(/after\s+(\d{1,2}:\d{2})/);
+  const before = t.match(/לפני\s+(\d{1,2}:\d{2})/) ?? t.match(/before\s+(\d{1,2}:\d{2})/);
+  if (after) hints.time_from = after[1]!.padStart(5, "0");
+  if (before) hints.time_to = before[1]!.padStart(5, "0");
+  return hints;
 }
 
 function ordinalFromText(t: string): number | undefined {
@@ -129,8 +193,12 @@ export class FakeAIProvider implements AIProvider {
     if (t.includes("לבטל") || t.includes("ביטול")) {
       return { intent: "CANCEL_BOOKING", confidence: 0.9 };
     }
-    if (t.includes("לשנות") || t.includes("לדחות") || t.includes("reschedule")) {
-      return { intent: "RESCHEDULE_BOOKING", confidence: 0.9 };
+    if (t.includes("לשנות") || t.includes("לדחות") || t.includes("תזיז") || t.includes("reschedule")) {
+      return {
+        intent: "RESCHEDULE_BOOKING",
+        confidence: 0.9,
+        ...availabilityHints(t, input.context),
+      };
     }
     if (t.includes("התור") || t.includes("התורים")) {
       return { intent: "GET_BOOKING", confidence: 0.9 };
@@ -160,23 +228,20 @@ export class FakeAIProvider implements AIProvider {
       return { intent: "CLARIFY", confidence: 0.9, ordinal };
     }
     if (t.includes("השבוע") || t.includes("this week")) {
-      return { intent: "FIND_AVAILABILITY", confidence: 0.9, relative_when: "THIS_WEEK" };
-    }
-    if (t.includes("תספורת")) {
       return {
         intent: "FIND_AVAILABILITY",
         confidence: 0.9,
-        relative_when: "TOMORROW",
-        time_window: "EVENING",
-        service_name: "תספורת",
+        relative_when: "THIS_WEEK",
+        ...availabilityHints(t, input.context),
       };
     }
-    if (t.includes("מחר") || t.includes("ערב") || t.includes("משהו")) {
+    if (t.includes("תספורת") || t.includes("מחר") || t.includes("ערב") || t.includes("בוקר") || t.includes("משהו")) {
       return {
         intent: "FIND_AVAILABILITY",
         confidence: 0.9,
-        relative_when: "TOMORROW",
-        time_window: "EVENING",
+        relative_when: t.includes("השבוע") || t.includes("this week") ? "THIS_WEEK" : t.includes("מחר") ? "TOMORROW" : undefined,
+        ...availabilityHints(t, input.context),
+        ...(t.includes("תספורת") ? { service_name: "תספורת" } : {}),
       };
     }
     if (ordinal && state === "IDLE") {
