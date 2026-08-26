@@ -1,15 +1,20 @@
 import type { Pool } from "pg";
+import type { PoolClient } from "pg";
 import type { PhoneCryptoConfig } from "@tavo/security";
 import { lookupCandidates, normalizePhone, sealPhone } from "@tavo/security";
 import type { TrustedTenantContext } from "@tavo/shared";
 import { Errors } from "@tavo/shared";
 import {
   cancelAppointment,
+  consumeOfferedSlot,
   findCustomerByLookup,
   getAppointment,
+  getBookingCommand,
   getStaff,
   insertAppointment,
   insertAudit,
+  insertBookingCommand,
+  lockOfferedSlot,
   upsertCustomer,
   updateAppointmentSchedule,
   withTenant,
@@ -110,17 +115,100 @@ export class AppointmentService {
 
   async cancel(ctx: TrustedTenantContext, appointmentId: string) {
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      const row = await cancelAppointment(client, ctx.tenantId, appointmentId);
-      if (!row) throw Errors.notFound("appointment");
-      await insertAudit(client, ctx.tenantId, {
-        actorType: ctx.actorType,
-        actorId: ctx.actorId,
-        action: "appointment.cancelled",
-        objectType: "appointment",
-        objectId: row.id,
-      });
-      return row;
+      return this.cancelOnClient(client, ctx, appointmentId);
     });
+  }
+
+  async cancelOnClient(
+    client: PoolClient,
+    ctx: TrustedTenantContext,
+    appointmentId: string,
+    command?: { commandKey: string; inboundEventId: string },
+  ) {
+    if (command) {
+      const existing = await getBookingCommand(client, ctx.tenantId, command.commandKey);
+      if (existing) {
+        const row = await getAppointment(client, ctx.tenantId, existing.appointment_id);
+        if (row) return row;
+      }
+    }
+    const row = await cancelAppointment(client, ctx.tenantId, appointmentId);
+    if (!row) throw Errors.notFound("appointment");
+    if (command) {
+      await insertBookingCommand(client, ctx.tenantId, {
+        commandKey: command.commandKey,
+        operation: "CANCEL",
+        inboundEventId: command.inboundEventId,
+        appointmentId: row.id,
+        resultJson: { id: row.id, status: row.status },
+      });
+    }
+    await insertAudit(client, ctx.tenantId, {
+      actorType: ctx.actorType,
+      actorId: ctx.actorId,
+      action: "appointment.cancelled",
+      objectType: "appointment",
+      objectId: row.id,
+    });
+    return row;
+  }
+
+  async bookFromOfferedSlot(
+    client: PoolClient,
+    ctx: TrustedTenantContext,
+    input: {
+      conversationId: string;
+      slotRef: string;
+      customerId: string;
+      inboundEventId: string;
+      commandKey: string;
+    },
+  ) {
+    const replay = await getBookingCommand(client, ctx.tenantId, input.commandKey);
+    if (replay) {
+      const row = await getAppointment(client, ctx.tenantId, replay.appointment_id);
+      if (row) return row;
+    }
+    const slot = await lockOfferedSlot(client, ctx.tenantId, input.conversationId, input.slotRef);
+    if (!slot) throw Errors.validation("unknown slot");
+    if (slot.consumed_at) throw Errors.validation("slot already used");
+    if (slot.expires_at.getTime() <= Date.now()) throw Errors.validation("slot expired");
+    const { occupancy, service } = await this.scheduling.assertSlotAvailableOnClient(client, ctx, {
+      serviceId: slot.service_id,
+      staffId: slot.staff_id,
+      startAt: slot.start_at,
+    });
+    const staff = await getStaff(client, ctx.tenantId, slot.staff_id);
+    if (!staff) throw Errors.notFound("staff");
+    const row = await insertAppointment(client, ctx.tenantId, {
+      customerId: input.customerId,
+      staffId: slot.staff_id,
+      serviceId: slot.service_id,
+      locationId: staff.location_id,
+      startAt: occupancy.startAt,
+      endAt: occupancy.endAt,
+      occupiedStartAt: occupancy.occupiedStartAt,
+      occupiedEndAt: occupancy.occupiedEndAt,
+      source: "WHATSAPP",
+    });
+    const consumed = await consumeOfferedSlot(client, ctx.tenantId, input.slotRef, input.inboundEventId);
+    if (!consumed) throw Errors.validation("slot already used");
+    await insertBookingCommand(client, ctx.tenantId, {
+      commandKey: input.commandKey,
+      operation: "CREATE",
+      inboundEventId: input.inboundEventId,
+      appointmentId: row.id,
+      resultJson: { id: row.id, startAt: row.start_at.toISOString(), status: row.status },
+    });
+    await insertAudit(client, ctx.tenantId, {
+      actorType: ctx.actorType,
+      actorId: ctx.actorId,
+      action: "appointment.created",
+      objectType: "appointment",
+      objectId: row.id,
+      metadata: { serviceId: service.id, source: "WHATSAPP" },
+    });
+    return row;
   }
 
   async get(ctx: TrustedTenantContext, appointmentId: string) {

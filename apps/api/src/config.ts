@@ -5,6 +5,12 @@ export type AppConfig = {
   databaseUrl: string;
   apiKeys: Map<string, string>;
   phones: PhoneCryptoConfig;
+  meta?: {
+    appSecret: string;
+    verifyToken: string;
+    routingHmacKey: Buffer;
+    messages: { encryptionKeyring: import("@tavo/security").Keyring; writeVersion: number };
+  };
 };
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {

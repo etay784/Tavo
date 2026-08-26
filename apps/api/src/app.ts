@@ -3,12 +3,16 @@ import { Pool } from "pg";
 import { z } from "zod";
 import { AppointmentService, CatalogService, SchedulingService } from "@tavo/domain";
 import { DomainError, systemClock, type Clock, type TrustedTenantContext } from "@tavo/shared";
+import { persistParsedWebhook } from "@tavo/orchestrator";
+import { verifyMetaSignature, verifySubscription } from "@tavo/whatsapp";
+import { insertSystemSecurityEvent } from "@tavo/database";
 import type { AppConfig } from "./config";
 import { tenantForApiKey } from "./config";
 
 declare module "fastify" {
   interface FastifyRequest {
     tenant: TrustedTenantContext | null;
+    rawBody?: Buffer;
   }
 }
 
@@ -37,6 +41,19 @@ function rateLimit(key: string, limit = 120, windowMs = 60_000) {
 
 export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClock): FastifyInstance {
   const app = Fastify({ logger: false });
+  app.addHook("preParsing", async (req, _reply, payload) => {
+    if (!(req.url.startsWith("/webhooks/meta/whatsapp") && req.method === "POST")) {
+      return payload;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of payload) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    const buf = Buffer.concat(chunks);
+    req.rawBody = buf;
+    const { Readable } = await import("node:stream");
+    return Readable.from(buf);
+  });
   const scheduling = new SchedulingService(pool, clock);
   const catalog = new CatalogService(pool);
   const appointments = new AppointmentService(pool, scheduling, config.phones);
@@ -44,7 +61,7 @@ export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClo
   app.decorateRequest("tenant", null as TrustedTenantContext | null);
 
   app.addHook("preHandler", async (req, reply) => {
-    if (req.url === "/health") return;
+    if (req.url === "/health" || req.url.startsWith("/webhooks/")) return;
     const header = req.headers.authorization;
     if (!header || !header.startsWith("Bearer ")) {
       return reply.code(401).send({ error: { code: "UNAUTHORIZED" } });
@@ -70,6 +87,51 @@ export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClo
   });
 
   app.get("/health", async () => ({ ok: true }));
+
+  app.get("/webhooks/meta/whatsapp", async (req, reply) => {
+    const q = req.query as { "hub.mode"?: string; "hub.verify_token"?: string; "hub.challenge"?: string };
+    const meta = config.meta;
+    if (!meta) return reply.code(503).send();
+    const result = verifySubscription(
+      { mode: q["hub.mode"], token: q["hub.verify_token"], challenge: q["hub.challenge"] },
+      meta.verifyToken,
+    );
+    if (!result.ok) return reply.code(403).send();
+    return reply.type("text/plain").send(result.challenge);
+  });
+
+  app.post("/webhooks/meta/whatsapp", async (req, reply) => {
+    const meta = config.meta;
+    if (!meta) return reply.code(503).send();
+    const raw = req.rawBody ?? Buffer.from("");
+    const sig = typeof req.headers["x-hub-signature-256"] === "string" ? req.headers["x-hub-signature-256"] : undefined;
+    if (!verifyMetaSignature(raw, sig, meta.appSecret)) {
+      const c = await pool.connect();
+      try {
+        await insertSystemSecurityEvent(c, "webhook.signature_rejected", { reason: sig ? "mismatch" : "missing" });
+      } catch {
+        /* ignore */
+      } finally {
+        c.release();
+      }
+      return reply.code(403).send({ error: { code: "FORBIDDEN" } });
+    }
+    if (req.body && typeof req.body === "object" && (req.body as { __malformed?: boolean }).__malformed) {
+      const c = await pool.connect();
+      try {
+        await insertSystemSecurityEvent(c, "webhook.malformed_envelope", { schema: "json" });
+      } finally {
+        c.release();
+      }
+      return reply.code(200).send({ ok: true });
+    }
+    try {
+      await persistParsedWebhook(pool, raw, req.body, meta.messages, meta.routingHmacKey);
+    } catch {
+      return reply.code(200).send({ ok: true });
+    }
+    return reply.code(200).send({ ok: true });
+  });
 
   app.post("/v1/staff", async (req) => {
     const body = z.object({ name: z.string().min(1) }).parse(req.body);

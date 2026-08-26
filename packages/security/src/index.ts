@@ -33,6 +33,9 @@ export function normalizePhone(input: string): string {
   if (/^0[5]\d{8}$/.test(digitsOrPlus)) {
     return `+972${digitsOrPlus.slice(1)}`;
   }
+  if (/^9725\d{8}$/.test(digitsOrPlus) || /^[1-9]\d{7,14}$/.test(digitsOrPlus)) {
+    return `+${digitsOrPlus}`;
+  }
   throw new Error("phone must be E.164 or Israeli mobile 05XXXXXXXX");
 }
 
@@ -72,6 +75,14 @@ export function encryptPhone(
   return { ciphertext: packed, version };
 }
 
+export function encryptUtf8(
+  plaintext: string,
+  key: Buffer,
+  version: number,
+): { ciphertext: string; version: number } {
+  return encryptPhone(plaintext, key, version);
+}
+
 export function decryptPhone(
   ciphertext: string,
   encryptionKeyring: Keyring,
@@ -91,6 +102,14 @@ export function decryptPhone(
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+}
+
+export function decryptUtf8(
+  ciphertext: string,
+  encryptionKeyring: Keyring,
+  version: number,
+): string {
+  return decryptPhone(ciphertext, encryptionKeyring, version);
 }
 
 export type PhoneCryptoConfig = {

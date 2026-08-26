@@ -104,7 +104,7 @@ describe("roles and FORCE RLS", () => {
     for (const row of tables.rows) {
       expect(row.owner).toBe("tavo_migrator");
       expect(row.owner).not.toBe("tavo_app");
-      if (row.relname === "schema_migrations") {
+      if (row.relname === "schema_migrations" || row.relname === "system_security_events") {
         expect(row.rls).toBe(false);
         continue;
       }

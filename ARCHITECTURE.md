@@ -188,3 +188,7 @@ Until that harness exists, tests call domain services and repositories directly.
 - `ADR/0005-phone-hmac-rotation.md`
 - `ADR/0006-pin-github-actions.md`
 - `AI_Receptionist_Product_Specification.md`
+
+## 13. Phase 2A (WhatsApp + FakeAI)
+
+See `ADR/0007`–`ADR/0012`. Runtime uses `tavo_routing` SECURITY DEFINER helpers (`search_path = pg_catalog`, schema-qualified names) to resolve integrations and claim jobs, then `tavo_app` + transaction-local RLS. No real LLM provider (`ADR/0012` deferred). `tavo_app` has no `BYPASSRLS` and no `CREATE` on `public` or `tavo_routing`.

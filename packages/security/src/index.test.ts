@@ -17,8 +17,8 @@ const encJson = JSON.stringify({
 });
 
 describe("phone crypto", () => {
-  it("normalizes Israeli mobile", () => {
-    expect(normalizePhone("050-123-4567")).toBe("+972501234567");
+  it("normalizes WhatsApp wa_id without plus", () => {
+    expect(normalizePhone("972501234567")).toBe("+972501234567");
   });
 
   it("uses keyed HMAC and all keyring versions for lookup", () => {
