@@ -1,0 +1,17 @@
+# Gitleaks (MIT) config. Allowlisted hits are documented placeholders, not production credentials.
+title = "tavo"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Local ephemeral Postgres role passwords used only by initdb test clusters"
+paths = [
+  '''packages/database/sql/000_roles\.sql''',
+  '''packages/database/src/migrate\.ts''',
+  '''packages/database/src/ephemeral-pg\.ts''',
+]
+regexes = [
+  '''migrator-secret''',
+  '''app-secret''',
+]
