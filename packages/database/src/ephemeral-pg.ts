@@ -107,7 +107,21 @@ export async function startEphemeralPostgres(): Promise<EphemeralPg> {
     } catch {
       /* already stopped */
     }
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    const deadline = Date.now() + 5_000;
+    let last: unknown;
+    while (Date.now() < deadline) {
+      try {
+        fs.rmSync(dataDir, { recursive: true, force: true });
+        last = undefined;
+        break;
+      } catch (e) {
+        last = e;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
+    if (last && fs.existsSync(dataDir)) {
+      /* Windows may hold the datadir briefly; tests already finished. */
+    }
   };
 
   return {

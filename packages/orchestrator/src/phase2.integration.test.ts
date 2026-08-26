@@ -194,8 +194,204 @@ describe("phase 2A whatsapp worker", () => {
     await runOutboundOnce(pool, "w-wrap", phoneKeys, messages, fakeWa);
     const wrapped = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
     expect(wrapped).toContain("זמין:");
-    expect(wrapped).toContain("09:07");
+    expect(wrapped).not.toContain("09:07");
+    expect(wrapped).not.toContain("בחינם");
     ai.wrapper = null;
+  });
+
+  it("issues a new offer set after booking and does not return consumed slots", async () => {
+    const from = "972506666666";
+    const raw1 = JSON.stringify(textPayload("wamid-off1", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-off", processor);
+    await runOutboundOnce(pool, "w-off", phoneKeys, messages, fakeWa);
+    const firstOffer = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(firstOffer).toContain("2)");
+
+    const raw2 = JSON.stringify(textPayload("wamid-off-sel", "את השני", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-off", processor);
+    await runOutboundOnce(pool, "w-off", phoneKeys, messages, fakeWa);
+
+    const openAfter = await withTenant(pool, TENANT, async (c) => {
+      const conv = await c.query<{ conversation_id: string }>(
+        `SELECT conversation_id FROM whatsapp_inbound_events WHERE provider_message_id = 'wamid-off1'`,
+      );
+      const { listOpenOfferedSlots } = await import("@tavo/database");
+      return listOpenOfferedSlots(c, TENANT, conv.rows[0]!.conversation_id);
+    });
+    expect(openAfter.find((s) => s.ordinal === 2)).toBeUndefined();
+
+    const raw3 = JSON.stringify(textPayload("wamid-off2", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw3), JSON.parse(raw3), messages, routingKey);
+    await runInboundOnce(pool, "w-off", processor);
+    await runOutboundOnce(pool, "w-off", phoneKeys, messages, fakeWa);
+    const secondOffer = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(secondOffer).toContain("זמין:");
+    expect(secondOffer).toContain("1)");
+
+    const raw4 = JSON.stringify(textPayload("wamid-off-sel2", "את הראשון", from));
+    await persistParsedWebhook(pool, Buffer.from(raw4), JSON.parse(raw4), messages, routingKey);
+    await runInboundOnce(pool, "w-off", processor);
+    await runOutboundOnce(pool, "w-off", phoneKeys, messages, fakeWa);
+    const confirm = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(confirm).toContain("התור נקבע");
+    const sets = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(DISTINCT o.offer_set_id)::int AS n
+         FROM offered_slots o
+         JOIN whatsapp_inbound_events e ON e.conversation_id = o.conversation_id
+         WHERE e.provider_message_id = 'wamid-off1'`,
+      );
+      return r.rows[0]!.n;
+    });
+    expect(sets).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not hold a business transaction open during delayed AI or Graph calls", async () => {
+    const idle = async () => {
+      const c = await pool.connect();
+      try {
+        const r = await c.query<{ n: number }>(
+          `SELECT count(*)::int AS n FROM pg_stat_activity WHERE state = 'idle in transaction'`,
+        );
+        return r.rows[0]!.n;
+      } finally {
+        c.release();
+      }
+    };
+    ai.delayMs = 250;
+    const raw = JSON.stringify(textPayload("wamid-delay-ai", "יש משהו מחר בערב?", "972507777777"));
+    await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+    const inboundP = runInboundOnce(pool, "w-delay", processor);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(await idle()).toBe(0);
+    await inboundP;
+    ai.delayMs = 0;
+
+    fakeWa.delayMs = 250;
+    const outP = runOutboundOnce(pool, "w-delay", phoneKeys, messages, fakeWa);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(await idle()).toBe(0);
+    await outP;
+    fakeWa.delayMs = 0;
+  });
+
+  it("does not mutate after a lost conversation lease", async () => {
+    const from = "972508888888";
+    const raw = JSON.stringify(textPayload("wamid-lease", "יש משהו מחר בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+    ai.delayMs = 200;
+    const p = runInboundOnce(pool, "w-lease", processor);
+    for (let i = 0; i < 40; i += 1) {
+      const tok = await withTenant(pool, TENANT, async (c) => {
+        const r = await c.query<{ lease_token: string | null }>(
+          `SELECT conv.lease_token
+           FROM conversations conv
+           JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+           WHERE e.provider_message_id = 'wamid-lease'`,
+        );
+        return r.rows[0]?.lease_token;
+      });
+      if (tok) break;
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    await withTenant(pool, TENANT, async (c) => {
+      await c.query(
+        `UPDATE conversations SET lock_version = lock_version + 99, lease_token = 'stolen'
+         WHERE id = (SELECT conversation_id FROM whatsapp_inbound_events WHERE provider_message_id = 'wamid-lease')`,
+      );
+    });
+    await p;
+    ai.delayMs = 0;
+    const offers = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM offered_slots
+         WHERE conversation_id = (
+           SELECT conversation_id FROM whatsapp_inbound_events WHERE provider_message_id = 'wamid-lease'
+         )`,
+      );
+      return r.rows[0]!.n;
+    });
+    expect(offers).toBe(0);
+  });
+
+  it("asks for a service when more than one is active", async () => {
+    await catalog.createService(ctx, {
+      name: "זקן",
+      durationMinutes: 20,
+      priceMinor: 4000,
+    });
+    const raw = JSON.stringify(textPayload("wamid-svc", "יש משהו מחר בערב?", "972509000001"));
+    await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+    await runInboundOnce(pool, "w-svc", processor);
+    await runOutboundOnce(pool, "w-svc", phoneKeys, messages, fakeWa);
+    const body = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(body).toContain("איזה שירות");
+    expect(body).toContain("זקן");
+  });
+
+  it("cancels only the authenticated customer's appointment", async () => {
+    const scheduling = new SchedulingService(pool, clock);
+    const appointments = new AppointmentService(pool, scheduling, phoneKeys);
+    const staff = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(`SELECT id FROM staff_members LIMIT 1`);
+      return r.rows[0]!.id;
+    });
+    const service = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(`SELECT id FROM services WHERE name = 'תספורת' LIMIT 1`);
+      return r.rows[0]!.id;
+    });
+    const victim = await appointments.create(ctx, {
+      staffId: staff,
+      serviceId: service,
+      startAt: new Date("2026-08-26T07:00:00.000Z"),
+      customerPhone: "972509111111",
+    });
+    ai.nextIntent = { intent: "CANCEL_BOOKING", confidence: 0.99, appointment_id: victim.id };
+    const raw = JSON.stringify(textPayload("wamid-xcancel", "לבטל", "972509222222"));
+    await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+    await runInboundOnce(pool, "w-xcancel", processor);
+    await runOutboundOnce(pool, "w-xcancel", phoneKeys, messages, fakeWa);
+    const still = await appointments.get(ctx, victim.id);
+    expect(still.status).toBe("CONFIRMED");
+    const attackerBody = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(attackerBody).not.toContain("התור בוטל");
+    ai.nextIntent = null;
+  });
+
+  it("marks inbound DEAD after bounded retries", async () => {
+    const tight = new InboundProcessor(
+      pool,
+      clock,
+      phoneKeys,
+      messages,
+      new SchedulingService(pool, clock),
+      new AppointmentService(pool, new SchedulingService(pool, clock), phoneKeys),
+      ai,
+      5,
+    );
+    ai.delayMs = 80;
+    const raw = JSON.stringify(textPayload("wamid-dead", "יש משהו מחר בערב?", "972509333333"));
+    await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+    for (let i = 0; i < 8; i += 1) {
+      await runInboundOnce(pool, `w-dead-${i}`, tight);
+      await withTenant(pool, TENANT, async (c) => {
+        await c.query(
+          `UPDATE whatsapp_inbound_events SET next_attempt_at = now()
+           WHERE provider_message_id = 'wamid-dead' AND status = 'FAILED'`,
+        );
+      });
+    }
+    ai.delayMs = 0;
+    const st = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ status: string; attempt_count: number }>(
+        `SELECT status, attempt_count FROM whatsapp_inbound_events WHERE provider_message_id = 'wamid-dead'`,
+      );
+      return r.rows[0]!;
+    });
+    expect(st.status).toBe("DEAD");
+    expect(st.attempt_count).toBe(8);
   });
 
   it("uses a 128-bit slotRef and message keys distinct from phone keys", async () => {

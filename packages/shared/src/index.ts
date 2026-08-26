@@ -63,3 +63,13 @@ export const ORCHESTRATOR_DEADLINE_MS = 45_000;
 export const LEASE_TTL_MS = 75_000;
 
 export const LEASE_TTL_SECONDS = LEASE_TTL_MS / 1000;
+
+export const INBOUND_MAX_ATTEMPTS = 8;
+export const OUTBOUND_MAX_ATTEMPTS = 8;
+export const LLM_SENDER_PER_MINUTE = 10;
+export const LLM_TENANT_PER_HOUR = 120;
+
+export function retryBackoffSeconds(attemptCount: number): number {
+  const n = Math.max(1, Math.min(attemptCount, 12));
+  return Math.min(300, 2 ** n);
+}

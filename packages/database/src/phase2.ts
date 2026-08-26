@@ -102,10 +102,11 @@ export async function getInboundEvent(client: PoolClient, tenantId: string, id: 
     text_encrypted: string | null;
     text_encryption_key_version: number | null;
     lock_version: number | null;
+    attempt_count: number;
   }>(
     `SELECT id, tenant_id, conversation_id, integration_id, provider_message_id,
             event_kind, status, wa_timestamp, sender_encrypted, sender_encryption_key_version,
-            text_encrypted, text_encryption_key_version, 0 AS lock_version
+            text_encrypted, text_encryption_key_version, 0 AS lock_version, attempt_count
      FROM whatsapp_inbound_events WHERE tenant_id = $1 AND id = $2`,
     [tenantId, id],
   );
@@ -124,15 +125,18 @@ export async function upsertConversation(
     lock_version: number;
     lease_owner: string | null;
     lease_expires_at: Date | null;
+    lease_token: string | null;
     service_id: string | null;
     clarify_count: number;
+    current_offer_set_id: string | null;
+    pending_appointment_id: string | null;
   }>(
     `INSERT INTO conversations (tenant_id, customer_id)
      VALUES ($1,$2)
      ON CONFLICT (tenant_id, customer_id)
      DO UPDATE SET updated_at = now()
-     RETURNING id, customer_id, state, lock_version, lease_owner, lease_expires_at,
-               service_id, clarify_count`,
+     RETURNING id, customer_id, state, lock_version, lease_owner, lease_expires_at, lease_token,
+               service_id, clarify_count, current_offer_set_id, pending_appointment_id`,
     [tenantId, customerId],
   );
   return r.rows[0]!;
@@ -155,19 +159,20 @@ export async function tryAcquireConversationLease(
   client: PoolClient,
   tenantId: string,
   conversationId: string,
-  workerId: string,
+  leaseToken: string,
   ttlSeconds: number,
 ) {
-  const r = await client.query<{ lock_version: number }>(
+  const r = await client.query<{ lock_version: number; lease_token: string }>(
     `UPDATE conversations
      SET lease_owner = $3,
+         lease_token = $3,
          lease_expires_at = now() + make_interval(secs => $4),
          lock_version = lock_version + 1,
          updated_at = now()
      WHERE tenant_id = $1 AND id = $2
-       AND (lease_expires_at IS NULL OR lease_expires_at < now() OR lease_owner = $3)
-     RETURNING lock_version`,
-    [tenantId, conversationId, workerId, ttlSeconds],
+       AND (lease_expires_at IS NULL OR lease_expires_at < now())
+     RETURNING lock_version, lease_token`,
+    [tenantId, conversationId, leaseToken, ttlSeconds],
   );
   return r.rows[0];
 }
@@ -176,14 +181,14 @@ export async function releaseConversationLease(
   client: PoolClient,
   tenantId: string,
   conversationId: string,
-  workerId: string,
+  leaseToken: string,
   lockVersion: number,
 ) {
   const r = await client.query(
     `UPDATE conversations
-     SET lease_owner = NULL, lease_expires_at = NULL, updated_at = now()
-     WHERE tenant_id = $1 AND id = $2 AND lease_owner = $3 AND lock_version = $4`,
-    [tenantId, conversationId, workerId, lockVersion],
+     SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = now()
+     WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4`,
+    [tenantId, conversationId, leaseToken, lockVersion],
   );
   return (r.rowCount ?? 0) === 1;
 }
@@ -192,22 +197,34 @@ export async function updateConversationState(
   client: PoolClient,
   tenantId: string,
   conversationId: string,
-  workerId: string,
+  leaseToken: string,
   lockVersion: number,
-  patch: { state: string; serviceId?: string | null; clarifyCount?: number },
+  patch: {
+    state: string;
+    serviceId?: string | null;
+    pendingAppointmentId?: string | null;
+    currentOfferSetId?: string | null;
+    clarifyCount?: number;
+  },
 ) {
   const r = await client.query(
     `UPDATE conversations
-     SET state = $5, service_id = COALESCE($6, service_id),
-         clarify_count = COALESCE($7, clarify_count), updated_at = now()
-     WHERE tenant_id = $1 AND id = $2 AND lease_owner = $3 AND lock_version = $4`,
+     SET state = $5,
+         service_id = $6,
+         pending_appointment_id = $7,
+         current_offer_set_id = COALESCE($8, current_offer_set_id),
+         clarify_count = COALESCE($9, clarify_count),
+         updated_at = now()
+     WHERE tenant_id = $1 AND id = $2 AND lease_token = $3 AND lock_version = $4`,
     [
       tenantId,
       conversationId,
-      workerId,
+      leaseToken,
       lockVersion,
       patch.state,
       patch.serviceId ?? null,
+      patch.pendingAppointmentId ?? null,
+      patch.currentOfferSetId ?? null,
       patch.clarifyCount ?? null,
     ],
   );
@@ -233,13 +250,16 @@ export async function markInboundFailed(
   id: string,
   error: string,
   retrySeconds: number,
+  maxAttempts: number,
 ) {
   await client.query(
     `UPDATE whatsapp_inbound_events
-     SET status = 'FAILED', last_error = $3, next_attempt_at = now() + make_interval(secs => $4),
+     SET status = CASE WHEN attempt_count >= $5 THEN 'DEAD'::inbound_event_status ELSE 'FAILED'::inbound_event_status END,
+         last_error = $3,
+         next_attempt_at = now() + make_interval(secs => $4),
          lock_expires_at = NULL, locked_by = NULL
      WHERE tenant_id = $1 AND id = $2`,
-    [tenantId, id, error.slice(0, 500), retrySeconds],
+    [tenantId, id, error.slice(0, 500), retrySeconds, maxAttempts],
   );
 }
 
@@ -247,6 +267,7 @@ export async function insertOfferedSlots(
   client: PoolClient,
   tenantId: string,
   conversationId: string,
+  offerSetId: string,
   slots: {
     slotRef: string;
     staffId: string;
@@ -256,16 +277,22 @@ export async function insertOfferedSlots(
     expiresAt: Date;
   }[],
 ) {
-  await client.query(
-    `DELETE FROM offered_slots WHERE tenant_id = $1 AND conversation_id = $2 AND consumed_at IS NULL`,
-    [tenantId, conversationId],
-  );
   for (const s of slots) {
     await client.query(
       `INSERT INTO offered_slots (
-         tenant_id, conversation_id, slot_ref, staff_id, service_id, start_at, ordinal, expires_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [tenantId, conversationId, s.slotRef, s.staffId, s.serviceId, s.startAt, s.ordinal, s.expiresAt],
+         tenant_id, conversation_id, offer_set_id, slot_ref, staff_id, service_id, start_at, ordinal, expires_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        tenantId,
+        conversationId,
+        offerSetId,
+        s.slotRef,
+        s.staffId,
+        s.serviceId,
+        s.startAt,
+        s.ordinal,
+        s.expiresAt,
+      ],
     );
   }
 }
@@ -283,11 +310,17 @@ export async function listOpenOfferedSlots(
     ordinal: number;
     expires_at: Date;
     consumed_at: Date | null;
+    offer_set_id: string;
   }>(
-    `SELECT slot_ref, staff_id, service_id, start_at, ordinal, expires_at, consumed_at
-     FROM offered_slots
-     WHERE tenant_id = $1 AND conversation_id = $2
-     ORDER BY ordinal`,
+    `SELECT o.slot_ref, o.staff_id, o.service_id, o.start_at, o.ordinal, o.expires_at, o.consumed_at, o.offer_set_id
+     FROM offered_slots o
+     INNER JOIN conversations c
+       ON c.tenant_id = o.tenant_id AND c.id = o.conversation_id
+     WHERE o.tenant_id = $1 AND o.conversation_id = $2
+       AND o.offer_set_id = c.current_offer_set_id
+       AND o.consumed_at IS NULL
+       AND o.expires_at > now()
+     ORDER BY o.ordinal`,
     [tenantId, conversationId],
   );
   return r.rows;
@@ -307,10 +340,13 @@ export async function lockOfferedSlot(
     expires_at: Date;
     consumed_at: Date | null;
   }>(
-    `SELECT slot_ref, staff_id, service_id, start_at, expires_at, consumed_at
-     FROM offered_slots
-     WHERE tenant_id = $1 AND conversation_id = $2 AND slot_ref = $3
-     FOR UPDATE`,
+    `SELECT o.slot_ref, o.staff_id, o.service_id, o.start_at, o.expires_at, o.consumed_at
+     FROM offered_slots o
+     INNER JOIN conversations c
+       ON c.tenant_id = o.tenant_id AND c.id = o.conversation_id
+     WHERE o.tenant_id = $1 AND o.conversation_id = $2 AND o.slot_ref = $3
+       AND o.offer_set_id = c.current_offer_set_id
+     FOR UPDATE OF o`,
     [tenantId, conversationId, slotRef],
   );
   return r.rows[0];
@@ -410,9 +446,10 @@ export async function getOutboundMessage(client: PoolClient, tenantId: string, i
     body_encrypted: string;
     message_encryption_key_version: number;
     provider_message_id: string | null;
+    attempt_count: number;
   }>(
     `SELECT id, customer_id, integration_id, conversation_id, status, body_encrypted,
-            message_encryption_key_version, provider_message_id
+            message_encryption_key_version, provider_message_id, attempt_count
      FROM whatsapp_outbound_messages WHERE tenant_id = $1 AND id = $2`,
     [tenantId, id],
   );
@@ -441,9 +478,30 @@ export async function markOutboundFailed(
 ) {
   await client.query(
     `UPDATE whatsapp_outbound_messages
-     SET status = 'FAILED', last_error = $3, lock_expires_at = NULL, locked_by = NULL, updated_at = now()
+     SET status = 'FAILED', last_error = $3, lock_expires_at = NULL, locked_by = NULL,
+         retry_class = NULL, updated_at = now()
      WHERE tenant_id = $1 AND id = $2`,
     [tenantId, id, error.slice(0, 500)],
+  );
+}
+
+export async function markOutboundTransient(
+  client: PoolClient,
+  tenantId: string,
+  id: string,
+  error: string,
+  retrySeconds: number,
+  maxAttempts: number,
+) {
+  await client.query(
+    `UPDATE whatsapp_outbound_messages
+     SET status = CASE WHEN attempt_count >= $5 THEN 'FAILED'::outbound_message_status ELSE 'PENDING'::outbound_message_status END,
+         retry_class = CASE WHEN attempt_count >= $5 THEN NULL ELSE 'TRANSIENT' END,
+         last_error = $3,
+         next_attempt_at = now() + make_interval(secs => $4),
+         lock_expires_at = NULL, locked_by = NULL, updated_at = now()
+     WHERE tenant_id = $1 AND id = $2`,
+    [tenantId, id, error.slice(0, 500), retrySeconds, maxAttempts],
   );
 }
 

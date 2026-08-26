@@ -14,6 +14,15 @@ function hmacId(value: string, key: Buffer): string {
   return createHmac("sha256", key).update(value, "utf8").digest("hex");
 }
 
+export class WebhookPersistError extends Error {
+  readonly retryable: boolean;
+  constructor(message: string, retryable = true) {
+    super(message);
+    this.name = "WebhookPersistError";
+    this.retryable = retryable;
+  }
+}
+
 export async function persistParsedWebhook(
   pool: Pool,
   raw: Buffer,
@@ -23,34 +32,72 @@ export async function persistParsedWebhook(
 ): Promise<{ accepted: number; duplicates: number }> {
   const parsed = parseInboundEnvelope(json);
   const sha = payloadSha256(raw);
-  if (!parsed.phoneNumberId) {
+  if (!parsed.ok) {
     const c = await pool.connect();
     try {
-      await insertSystemSecurityEvent(c, "webhook.malformed_envelope", { schema: "missing_phone_number_id" });
+      await insertSystemSecurityEvent(c, "webhook.malformed_envelope", { schema: parsed.reason });
     } finally {
       c.release();
     }
     return { accepted: 0, duplicates: 0 };
   }
-  const c = await pool.connect();
-  let resolved: { tenant_id: string; integration_id: string } | undefined;
-  try {
-    resolved = await resolveWhatsappIntegration(c, parsed.phoneNumberId);
-    if (!resolved) {
-      await insertSystemSecurityEvent(c, "webhook.unknown_phone_number_id", {
-        phone_number_id_hmac: hmacId(parsed.phoneNumberId, routingHmacKey),
-      });
-      return { accepted: 0, duplicates: 0 };
-    }
-  } finally {
-    c.release();
-  }
+
   let accepted = 0;
   let duplicates = 0;
+  let executableFailed = false;
+  const unknownPhones = new Set<string>();
+
   for (const event of parsed.events) {
-    const result = await persistOne(pool, resolved, sha, event, messages);
-    if (result === "dup") duplicates += 1;
-    else if (result === "ok") accepted += 1;
+    const phone =
+      event.kind === "unknown" ? event.phoneNumberId : event.phoneNumberId || null;
+    if (!phone) {
+      const c = await pool.connect();
+      try {
+        await insertSystemSecurityEvent(c, "webhook.malformed_envelope", {
+          schema: "missing_phone_number_id",
+        });
+      } finally {
+        c.release();
+      }
+      continue;
+    }
+
+    const c = await pool.connect();
+    let resolved: { tenant_id: string; integration_id: string } | undefined;
+    try {
+      resolved = await resolveWhatsappIntegration(c, phone);
+      if (!resolved) {
+        if (!unknownPhones.has(phone)) {
+          unknownPhones.add(phone);
+          await insertSystemSecurityEvent(c, "webhook.unknown_phone_number_id", {
+            phone_number_id_hmac: hmacId(phone, routingHmacKey),
+          });
+        }
+        continue;
+      }
+    } finally {
+      c.release();
+    }
+
+    try {
+      const result = await persistOne(pool, resolved, sha, event, messages, accepted + duplicates);
+
+      if (result === "dup") duplicates += 1;
+      else if (result === "ok") accepted += 1;
+    } catch (e) {
+      if (event.kind === "message_text") {
+        executableFailed = true;
+      }
+      if (event.kind === "message_text") {
+        throw e instanceof WebhookPersistError
+          ? e
+          : new WebhookPersistError(e instanceof Error ? e.message : "persist", true);
+      }
+    }
+  }
+
+  if (executableFailed) {
+    throw new WebhookPersistError("executable persist failed", true);
   }
   return { accepted, duplicates };
 }
@@ -61,9 +108,10 @@ async function persistOne(
   sha: string,
   event: ParsedInbound,
   messages: MessageCrypto,
+  uniquenessSalt: number,
 ): Promise<"ok" | "dup" | "skip"> {
   const key = messages.encryptionKeyring.get(messages.writeVersion);
-  if (!key) throw new Error("message key");
+  if (!key) throw new WebhookPersistError("message key", true);
   try {
     await withTenant(pool, resolved.tenant_id, async (client) => {
       if (event.kind === "message_text") {
@@ -86,7 +134,9 @@ async function persistOne(
       await insertInboundEvent(client, resolved.tenant_id, {
         integrationId: resolved.integration_id,
         providerMessageId:
-          event.kind === "status" ? event.id : `unknown:${sha}`,
+          event.kind === "status"
+            ? event.id
+            : `unknown:${sha}:${event.phoneNumberId ?? ""}:${uniquenessSalt}`,
         eventKind: event.kind === "status" ? "status" : "unknown",
         status: "IGNORED",
         waTimestamp: null,

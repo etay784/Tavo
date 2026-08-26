@@ -95,4 +95,117 @@ describe("meta webhook http", () => {
     });
     expect(signed.statusCode).toBe(200);
   });
+
+  it("returns 503 when persistence of a signed executable text event fails", async () => {
+    const failing = buildApp(
+      {
+        databaseUrl: pg.appUrl,
+        apiKeys: new Map([["key-a", TENANT]]),
+        phones,
+        meta: {
+          appSecret: APP_SECRET,
+          verifyToken: "verify-me",
+          routingHmacKey: Buffer.from("dd".repeat(32), "hex"),
+          messages,
+        },
+      },
+      pool,
+      { now: () => new Date("2026-08-25T08:00:00.000Z") },
+      {
+        persistWebhook: async () => {
+          throw new Error("persist down");
+        },
+      },
+    );
+    await failing.ready();
+    const raw = JSON.stringify({
+      object: "whatsapp_business_account",
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: "pn-a" },
+                messages: [
+                  {
+                    id: "wamid-persist-fail",
+                    from: "972501234567",
+                    timestamp: "1780000000",
+                    type: "text",
+                    text: { body: "שלום" },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const sig = `sha256=${createHmac("sha256", APP_SECRET).update(raw, "utf8").digest("hex")}`;
+    const res = await failing.inject({
+      method: "POST",
+      url: "/webhooks/meta/whatsapp",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sig },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(503);
+    expect(res.statusCode).not.toBe(200);
+    await failing.close();
+  });
+
+  it("persists every supported message in a signed batch before 200", async () => {
+    const raw = JSON.stringify({
+      object: "whatsapp_business_account",
+      entry: [
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: "pn-a" },
+                messages: [
+                  {
+                    id: "wamid-batch-1",
+                    from: "972501234567",
+                    timestamp: "1780000000",
+                    type: "text",
+                    text: { body: "אחת" },
+                  },
+                ],
+              },
+            },
+            {
+              value: {
+                metadata: { phone_number_id: "pn-a" },
+                messages: [
+                  {
+                    id: "wamid-batch-2",
+                    from: "972501234567",
+                    timestamp: "1780000001",
+                    type: "text",
+                    text: { body: "שתיים" },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const sig = `sha256=${createHmac("sha256", APP_SECRET).update(raw, "utf8").digest("hex")}`;
+    const res = await app.inject({
+      method: "POST",
+      url: "/webhooks/meta/whatsapp",
+      headers: { "content-type": "application/json", "x-hub-signature-256": sig },
+      payload: raw,
+    });
+    expect(res.statusCode).toBe(200);
+    const n = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM whatsapp_inbound_events
+         WHERE provider_message_id IN ('wamid-batch-1','wamid-batch-2') AND status = 'RECEIVED'`,
+      );
+      return r.rows[0]!.n;
+    });
+    expect(n).toBe(2);
+  });
 });

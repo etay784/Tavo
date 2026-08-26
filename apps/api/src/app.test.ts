@@ -39,7 +39,16 @@ describe("api harness", () => {
       hmacWriteVersion: 1,
       encryptionWriteVersion: 1,
     };
-    const base: Omit<AppConfig, "apiKeys"> = { databaseUrl: pg.appUrl, phones };
+    const meta = {
+      appSecret: "meta-secret-value",
+      verifyToken: "verify-token-value",
+      routingHmacKey: Buffer.from("ee".repeat(32), "hex"),
+      messages: {
+        encryptionKeyring: parseKeyring(JSON.stringify({ "1": "ff".repeat(32) })),
+        writeVersion: 1,
+      },
+    };
+    const base: Omit<AppConfig, "apiKeys"> = { databaseUrl: pg.appUrl, phones, meta };
     const clock = { now: () => new Date("2026-08-25T08:00:00.000Z") };
     appA = buildApp({ ...base, apiKeys: new Map([[KEY_A, TENANT_A]]) }, pool, clock);
     appB = buildApp({ ...base, apiKeys: new Map([[KEY_B, TENANT_B]]) }, pool, clock);

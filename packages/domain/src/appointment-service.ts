@@ -85,32 +85,61 @@ export class AppointmentService {
 
   async reschedule(ctx: TrustedTenantContext, appointmentId: string, startAt: Date) {
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      const existing = await getAppointment(client, ctx.tenantId, appointmentId);
-      if (!existing || existing.status !== "CONFIRMED") {
-        throw Errors.notFound("appointment");
-      }
-      const { occupancy } = await this.scheduling.assertSlotAvailableOnClient(client, ctx, {
-        serviceId: existing.service_id,
-        staffId: existing.staff_id,
-        startAt,
-        exceptAppointmentId: existing.id,
-      });
-      const row = await updateAppointmentSchedule(client, ctx.tenantId, existing.id, {
-        startAt: occupancy.startAt,
-        endAt: occupancy.endAt,
-        occupiedStartAt: occupancy.occupiedStartAt,
-        occupiedEndAt: occupancy.occupiedEndAt,
-      });
-      if (!row) throw Errors.notFound("appointment");
-      await insertAudit(client, ctx.tenantId, {
-        actorType: ctx.actorType,
-        actorId: ctx.actorId,
-        action: "appointment.rescheduled",
-        objectType: "appointment",
-        objectId: row.id,
-      });
-      return row;
+      return this.rescheduleOnClient(client, ctx, appointmentId, startAt);
     });
+  }
+
+  async rescheduleOnClient(
+    client: PoolClient,
+    ctx: TrustedTenantContext,
+    appointmentId: string,
+    startAt: Date,
+    opts?: { customerId: string; commandKey: string; inboundEventId: string },
+  ) {
+    if (opts) {
+      const existingCmd = await getBookingCommand(client, ctx.tenantId, opts.commandKey);
+      if (existingCmd) {
+        const row = await getAppointment(client, ctx.tenantId, existingCmd.appointment_id);
+        if (row) return row;
+      }
+    }
+    const existing = await getAppointment(client, ctx.tenantId, appointmentId);
+    if (!existing || existing.status !== "CONFIRMED") {
+      throw Errors.notFound("appointment");
+    }
+    if (opts && existing.customer_id !== opts.customerId) {
+      throw Errors.notFound("appointment");
+    }
+    const { occupancy } = await this.scheduling.assertSlotAvailableOnClient(client, ctx, {
+      serviceId: existing.service_id,
+      staffId: existing.staff_id,
+      startAt,
+      exceptAppointmentId: existing.id,
+    });
+    const row = await updateAppointmentSchedule(client, ctx.tenantId, existing.id, {
+      startAt: occupancy.startAt,
+      endAt: occupancy.endAt,
+      occupiedStartAt: occupancy.occupiedStartAt,
+      occupiedEndAt: occupancy.occupiedEndAt,
+    });
+    if (!row) throw Errors.notFound("appointment");
+    if (opts) {
+      await insertBookingCommand(client, ctx.tenantId, {
+        commandKey: opts.commandKey,
+        operation: "RESCHEDULE",
+        inboundEventId: opts.inboundEventId,
+        appointmentId: row.id,
+        resultJson: { id: row.id, startAt: row.start_at.toISOString(), status: row.status },
+      });
+    }
+    await insertAudit(client, ctx.tenantId, {
+      actorType: ctx.actorType,
+      actorId: ctx.actorId,
+      action: "appointment.rescheduled",
+      objectType: "appointment",
+      objectId: row.id,
+    });
+    return row;
   }
 
   async cancel(ctx: TrustedTenantContext, appointmentId: string) {
@@ -123,7 +152,7 @@ export class AppointmentService {
     client: PoolClient,
     ctx: TrustedTenantContext,
     appointmentId: string,
-    command?: { commandKey: string; inboundEventId: string },
+    command?: { commandKey: string; inboundEventId: string; customerId: string },
   ) {
     if (command) {
       const existing = await getBookingCommand(client, ctx.tenantId, command.commandKey);
@@ -131,6 +160,13 @@ export class AppointmentService {
         const row = await getAppointment(client, ctx.tenantId, existing.appointment_id);
         if (row) return row;
       }
+    }
+    const existing = await getAppointment(client, ctx.tenantId, appointmentId);
+    if (!existing || existing.status !== "CONFIRMED") {
+      throw Errors.notFound("appointment");
+    }
+    if (command && existing.customer_id !== command.customerId) {
+      throw Errors.notFound("appointment");
     }
     const row = await cancelAppointment(client, ctx.tenantId, appointmentId);
     if (!row) throw Errors.notFound("appointment");
@@ -207,6 +243,64 @@ export class AppointmentService {
       objectType: "appointment",
       objectId: row.id,
       metadata: { serviceId: service.id, source: "WHATSAPP" },
+    });
+    return row;
+  }
+
+  async rescheduleFromOfferedSlot(
+    client: PoolClient,
+    ctx: TrustedTenantContext,
+    input: {
+      conversationId: string;
+      slotRef: string;
+      customerId: string;
+      inboundEventId: string;
+      commandKey: string;
+      appointmentId: string;
+    },
+  ) {
+    const replay = await getBookingCommand(client, ctx.tenantId, input.commandKey);
+    if (replay) {
+      const row = await getAppointment(client, ctx.tenantId, replay.appointment_id);
+      if (row) return row;
+    }
+    const existing = await getAppointment(client, ctx.tenantId, input.appointmentId);
+    if (!existing || existing.status !== "CONFIRMED" || existing.customer_id !== input.customerId) {
+      throw Errors.notFound("appointment");
+    }
+    const slot = await lockOfferedSlot(client, ctx.tenantId, input.conversationId, input.slotRef);
+    if (!slot) throw Errors.validation("unknown slot");
+    if (slot.consumed_at) throw Errors.validation("slot already used");
+    if (slot.expires_at.getTime() <= Date.now()) throw Errors.validation("slot expired");
+    const { occupancy } = await this.scheduling.assertSlotAvailableOnClient(client, ctx, {
+      serviceId: existing.service_id,
+      staffId: slot.staff_id,
+      startAt: slot.start_at,
+      exceptAppointmentId: existing.id,
+    });
+    const row = await updateAppointmentSchedule(client, ctx.tenantId, existing.id, {
+      startAt: occupancy.startAt,
+      endAt: occupancy.endAt,
+      occupiedStartAt: occupancy.occupiedStartAt,
+      occupiedEndAt: occupancy.occupiedEndAt,
+    });
+    if (!row) throw Errors.notFound("appointment");
+    const consumed = await consumeOfferedSlot(client, ctx.tenantId, input.slotRef, input.inboundEventId);
+    if (!consumed) throw Errors.validation("slot already used");
+    await insertBookingCommand(client, ctx.tenantId, {
+      commandKey: input.commandKey,
+      operation: "RESCHEDULE",
+      inboundEventId: input.inboundEventId,
+      appointmentId: row.id,
+      resultJson: { id: row.id, startAt: row.start_at.toISOString(), status: row.status },
+    });
+    await insertAudit(client, ctx.tenantId, {
+      actorType: ctx.actorType,
+      actorId: ctx.actorId,
+      action: "appointment.rescheduled",
+      objectType: "appointment",
+      objectId: row.id,
+      metadata: { source: "WHATSAPP" },
     });
     return row;
   }

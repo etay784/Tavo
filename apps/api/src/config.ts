@@ -5,7 +5,7 @@ export type AppConfig = {
   databaseUrl: string;
   apiKeys: Map<string, string>;
   phones: PhoneCryptoConfig;
-  meta?: {
+  meta: {
     appSecret: string;
     verifyToken: string;
     routingHmacKey: Buffer;
@@ -19,6 +19,14 @@ function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
   return v;
 }
 
+function requireHex32(env: NodeJS.ProcessEnv, name: string): Buffer {
+  const v = requireEnv(env, name);
+  if (!/^[0-9a-fA-F]{64}$/.test(v)) {
+    throw new Error(`${name} must be 32-byte hex`);
+  }
+  return Buffer.from(v, "hex");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const keysRaw = JSON.parse(requireEnv(env, "TAVO_API_KEYS")) as Record<string, string>;
   const apiKeys = new Map(Object.entries(keysRaw));
@@ -30,6 +38,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!hmacKeyring.has(hmacWriteVersion) || !encryptionKeyring.has(encryptionWriteVersion)) {
     throw new Error("write key version not in keyring");
   }
+  const messageKeyring = parseKeyring(requireEnv(env, "TAVO_MESSAGE_ENCRYPTION_KEYS"));
+  const messageWriteVersion = Number(requireEnv(env, "TAVO_MESSAGE_ENCRYPTION_WRITE_VERSION"));
+  if (!messageKeyring.has(messageWriteVersion)) {
+    throw new Error("message write key version not in keyring");
+  }
+  const appSecret = requireEnv(env, "TAVO_META_APP_SECRET");
+  const verifyToken = requireEnv(env, "TAVO_META_VERIFY_TOKEN");
+  if (appSecret.length < 8 || verifyToken.length < 8) {
+    throw new Error("Meta app secret and verify token are required");
+  }
   return {
     databaseUrl: requireEnv(env, "DATABASE_URL"),
     apiKeys,
@@ -38,6 +56,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       encryptionKeyring,
       hmacWriteVersion,
       encryptionWriteVersion,
+    },
+    meta: {
+      appSecret,
+      verifyToken,
+      routingHmacKey: requireHex32(env, "TAVO_ROUTING_HMAC_KEY"),
+      messages: { encryptionKeyring: messageKeyring, writeVersion: messageWriteVersion },
     },
   };
 }

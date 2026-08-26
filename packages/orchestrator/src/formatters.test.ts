@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  composeOutbound,
   FALLBACK_HE,
   PAYMENT_UNAVAILABLE_HE,
   formatAvailabilityList,
@@ -15,7 +14,7 @@ describe("deterministic formatters", () => {
     );
     expect(block).toContain("17:00");
     expect(block).toContain("Daniel");
-    expect(composeOutbound("בשמחה", block)).toContain("17:00");
+    expect(block).not.toContain("09:07");
   });
 
   it("renders booking confirmation from structured fields", () => {

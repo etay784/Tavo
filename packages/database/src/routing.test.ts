@@ -213,4 +213,30 @@ describe("SECURITY DEFINER routing", () => {
     });
     expect(n).toBe(1);
   });
+
+  it("grants tavo_app least privilege on Phase 2 tables", async () => {
+    const commands = await superClient.query<{
+      sel: boolean;
+      ins: boolean;
+      upd: boolean;
+      del: boolean;
+    }>(
+      `SELECT
+         has_table_privilege('tavo_app', 'public.booking_commands', 'SELECT') AS sel,
+         has_table_privilege('tavo_app', 'public.booking_commands', 'INSERT') AS ins,
+         has_table_privilege('tavo_app', 'public.booking_commands', 'UPDATE') AS upd,
+         has_table_privilege('tavo_app', 'public.booking_commands', 'DELETE') AS del`,
+    );
+    expect(commands.rows[0]).toEqual({ sel: true, ins: true, upd: false, del: false });
+    const messages = await superClient.query<{ upd: boolean; del: boolean }>(
+      `SELECT
+         has_table_privilege('tavo_app', 'public.messages', 'UPDATE') AS upd,
+         has_table_privilege('tavo_app', 'public.messages', 'DELETE') AS del`,
+    );
+    expect(messages.rows[0]).toEqual({ upd: false, del: false });
+    const offered = await superClient.query<{ del: boolean }>(
+      `SELECT has_table_privilege('tavo_app', 'public.offered_slots', 'DELETE') AS del`,
+    );
+    expect(offered.rows[0]?.del).toBe(false);
+  });
 });

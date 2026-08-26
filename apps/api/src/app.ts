@@ -39,7 +39,12 @@ function rateLimit(key: string, limit = 120, windowMs = 60_000) {
   }
 }
 
-export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClock): FastifyInstance {
+export function buildApp(
+  config: AppConfig,
+  pool: Pool,
+  clock: Clock = systemClock,
+  hooks?: { persistWebhook?: typeof persistParsedWebhook },
+): FastifyInstance {
   const app = Fastify({ logger: false });
   app.addHook("preParsing", async (req, _reply, payload) => {
     if (!(req.url.startsWith("/webhooks/meta/whatsapp") && req.method === "POST")) {
@@ -91,7 +96,6 @@ export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClo
   app.get("/webhooks/meta/whatsapp", async (req, reply) => {
     const q = req.query as { "hub.mode"?: string; "hub.verify_token"?: string; "hub.challenge"?: string };
     const meta = config.meta;
-    if (!meta) return reply.code(503).send();
     const result = verifySubscription(
       { mode: q["hub.mode"], token: q["hub.verify_token"], challenge: q["hub.challenge"] },
       meta.verifyToken,
@@ -102,7 +106,6 @@ export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClo
 
   app.post("/webhooks/meta/whatsapp", async (req, reply) => {
     const meta = config.meta;
-    if (!meta) return reply.code(503).send();
     const raw = req.rawBody ?? Buffer.from("");
     const sig = typeof req.headers["x-hub-signature-256"] === "string" ? req.headers["x-hub-signature-256"] : undefined;
     if (!verifyMetaSignature(raw, sig, meta.appSecret)) {
@@ -126,9 +129,10 @@ export function buildApp(config: AppConfig, pool: Pool, clock: Clock = systemClo
       return reply.code(200).send({ ok: true });
     }
     try {
-      await persistParsedWebhook(pool, raw, req.body, meta.messages, meta.routingHmacKey);
+      const persist = hooks?.persistWebhook ?? persistParsedWebhook;
+      await persist(pool, raw, req.body, meta.messages, meta.routingHmacKey);
     } catch {
-      return reply.code(200).send({ ok: true });
+      return reply.code(503).send({ error: { code: "UNAVAILABLE" } });
     }
     return reply.code(200).send({ ok: true });
   });

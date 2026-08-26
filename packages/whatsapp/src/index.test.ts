@@ -22,8 +22,9 @@ describe("meta webhook crypto", () => {
     });
   });
 
-  it("parses text messages and statuses", () => {
+  it("parses every entry and change with its own phone_number_id", () => {
     const parsed = parseInboundEnvelope({
+      object: "whatsapp_business_account",
       entry: [
         {
           changes: [
@@ -41,10 +42,45 @@ describe("meta webhook crypto", () => {
                 ],
               },
             },
+            {
+              value: {
+                metadata: { phone_number_id: "pn-b" },
+                messages: [
+                  {
+                    id: "wamid.2",
+                    from: "972509999999",
+                    timestamp: "1780000001",
+                    type: "text",
+                    text: { body: "היי" },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        {
+          changes: [
+            {
+              value: {
+                metadata: { phone_number_id: "pn-a" },
+                statuses: [{ id: "wamid.status" }],
+              },
+            },
           ],
         },
       ],
     });
-    expect(parsed.events[0]).toMatchObject({ kind: "message_text", id: "wamid.1" });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.events).toHaveLength(3);
+    expect(parsed.events[0]).toMatchObject({ kind: "message_text", id: "wamid.1", phoneNumberId: "pn-a" });
+    expect(parsed.events[1]).toMatchObject({ kind: "message_text", id: "wamid.2", phoneNumberId: "pn-b" });
+    expect(parsed.events[2]).toMatchObject({ kind: "status", id: "wamid.status", phoneNumberId: "pn-a" });
+  });
+
+  it("rejects unsupported envelope shapes at runtime", () => {
+    expect(parseInboundEnvelope("nope").ok).toBe(false);
+    expect(parseInboundEnvelope({ object: "instagram", entry: [] }).ok).toBe(false);
+    expect(parseInboundEnvelope({ entry: { changes: [] } }).ok).toBe(false);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addMinutes, Errors, LEASE_TTL_MS, ORCHESTRATOR_DEADLINE_MS } from "./index";
+import { addMinutes, Errors, LEASE_TTL_MS, ORCHESTRATOR_DEADLINE_MS, retryBackoffSeconds } from "./index";
 
 describe("shared", () => {
   it("maps slot errors", () => {
@@ -13,5 +13,10 @@ describe("shared", () => {
 
   it("keeps lease TTL longer than the orchestrator deadline", () => {
     expect(LEASE_TTL_MS).toBeGreaterThan(ORCHESTRATOR_DEADLINE_MS);
+  });
+
+  it("bounds inbound/outbound retry backoff", () => {
+    expect(retryBackoffSeconds(1)).toBe(2);
+    expect(retryBackoffSeconds(20)).toBe(300);
   });
 });
