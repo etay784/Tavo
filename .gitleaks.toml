@@ -1,17 +1,12 @@
-# Gitleaks (MIT) config. Allowlisted hits are documented placeholders, not production credentials.
+# Gitleaks (MIT). No path-wide exemptions for application or migration SQL.
 title = "tavo"
 
 [extend]
 useDefault = true
 
+# Dependency trees and VCS internals only — never entire source files.
 [allowlist]
-description = "Local ephemeral Postgres role passwords used only by initdb test clusters"
 paths = [
-  '''packages/database/sql/000_roles\.sql''',
-  '''packages/database/src/migrate\.ts''',
-  '''packages/database/src/ephemeral-pg\.ts''',
-]
-regexes = [
-  '''migrator-secret''',
-  '''app-secret''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.git/''',
 ]

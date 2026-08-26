@@ -63,6 +63,17 @@ export async function startEphemeralPostgres(): Promise<EphemeralPg> {
     ["-D", dataDir, "-U", "postgres", "-A", "trust", "--encoding=UTF8", "--locale=C"],
     { stdio: "pipe" },
   );
+  const hba = path.join(dataDir, "pg_hba.conf");
+  fs.writeFileSync(
+    hba,
+    [
+      "local all all trust",
+      "host all all 127.0.0.1/32 trust",
+      "host all all ::1/128 trust",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
   const logFile = path.join(dataDir, "pg.log");
   await new Promise<void>((resolve, reject) => {
     const child = spawn(
@@ -103,8 +114,8 @@ export async function startEphemeralPostgres(): Promise<EphemeralPg> {
     port,
     dataDir,
     superuserUrl,
-    appUrl: `postgres://tavo_app:app-secret@127.0.0.1:${port}/postgres`,
-    migratorUrl: `postgres://tavo_migrator:migrator-secret@127.0.0.1:${port}/postgres`,
+    appUrl: `postgres://tavo_app@127.0.0.1:${port}/postgres`,
+    migratorUrl: `postgres://tavo_migrator@127.0.0.1:${port}/postgres`,
     stop,
   };
 }

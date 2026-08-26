@@ -104,6 +104,10 @@ describe("roles and FORCE RLS", () => {
     for (const row of tables.rows) {
       expect(row.owner).toBe("tavo_migrator");
       expect(row.owner).not.toBe("tavo_app");
+      if (row.relname === "schema_migrations") {
+        expect(row.rls).toBe(false);
+        continue;
+      }
       expect(row.rls).toBe(true);
       expect(row.force).toBe(true);
     }
@@ -340,6 +344,23 @@ describe("audit append-only", () => {
       await c.query("SELECT set_config('app.tenant_id', $1, true)", [TENANT_A]);
       await expect(c.query(`DELETE FROM audit_events WHERE id = $1`, [id])).rejects.toThrow();
       await c.query("ROLLBACK");
+    } finally {
+      c.release();
+    }
+  });
+});
+
+describe("schema_migrations", () => {
+  it("is owned by tavo_migrator and not readable by tavo_app", async () => {
+    const owner = await superClient.query<{ owner: string }>(
+      `SELECT pg_get_userbyid(c.relowner) AS owner
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = 'public' AND c.relname = 'schema_migrations'`,
+    );
+    expect(owner.rows[0]?.owner).toBe("tavo_migrator");
+    const c = await appPool.connect();
+    try {
+      await expect(c.query(`SELECT filename FROM schema_migrations`)).rejects.toThrow();
     } finally {
       c.release();
     }

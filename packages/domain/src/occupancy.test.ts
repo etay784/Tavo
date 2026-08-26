@@ -1,6 +1,6 @@
 import { DateTime } from "luxon";
 import { describe, expect, it } from "vitest";
-import { occupancySnapshot, subtractBusy, candidateStarts } from "./occupancy";
+import { occupancySnapshot, subtractBusy, candidateStarts, isOnCivilGrid } from "./occupancy";
 import { localWorkWindow, weekdaySunday0 } from "./civil-time";
 
 describe("occupancy snapshot", () => {
@@ -111,6 +111,15 @@ describe("civil slot grid", () => {
     ]);
     const instants = starts.map((d) => d.getTime());
     expect(new Set(instants).size).toBe(instants.length);
+  });
+});
+
+describe("civil grid", () => {
+  it("rejects off-grid local times such as 09:07", () => {
+    const off = new Date("2026-08-27T06:07:00.000Z");
+    expect(isOnCivilGrid(off, 15, "Asia/Jerusalem")).toBe(false);
+    const on = new Date("2026-08-27T06:00:00.000Z");
+    expect(isOnCivilGrid(on, 15, "Asia/Jerusalem")).toBe(true);
   });
 });
 

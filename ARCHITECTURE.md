@@ -76,7 +76,13 @@ Tenant identity is a **server-side property of the authenticated caller**, not a
 
 `tavo_app` must never be table owner and must never have `BYPASSRLS`. Protected tables use `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` so a future accidental owner still cannot skip policies unless they also have `BYPASSRLS`.
 
+Role passwords are **not** in SQL migrations or the migrator. Production credentials are provisioned in the secret manager. `tavo_migrator` is never an application login. Ephemeral tests use local trust authentication (`ephemeral-pg.ts`), not shared passwords.
+
 See `SECURITY.md` and `ADR/0003-database-roles-and-force-rls.md`.
+
+## 5b. Versioned SQL migrations
+
+`packages/database/sql/*.sql` is authoritative. `applyMigrations` records each filename in `schema_migrations` and runs a file only if it is not already stamped. A database that already has the Phase 1 `appointments` table is treated as having `000`–`002` applied (stamped without replay) so later files such as `003_schema_migrations.sql` can be applied in place. `schema_migrations` is owned by `tavo_migrator` and is not granted to `tavo_app`.
 
 ## 6. Transaction-local RLS (connection pooling)
 
@@ -115,6 +121,20 @@ WHERE (status = 'CONFIRMED');
 Concurrent inserts/updates of overlapping `CONFIRMED` rows for the same tenant and staff: exactly one transaction commits. The loser fails with PostgreSQL exclusion_violation (`23P01`) and is mapped to domain error `SLOT_NO_LONGER_AVAILABLE`.
 
 The domain may still pre-check working hours and existing busy intervals to produce clearer errors for non-race cases. That check is not the concurrency control.
+
+Create and reschedule (not only availability search) enforce the same booking rules before insert/update:
+
+- `start_at` is on the business civil-time slot grid (`slot_granularity_minutes` in `businesses.timezone`; seconds must be zero). Off-grid times such as 09:07 are rejected.
+- `start_at` is at least `min_advance_minutes` from now and strictly before now + `booking_horizon_days` (same 24×60-minute day length as search).
+- Occupancy must fit remaining free time after working hours, breaks, time off, and other `CONFIRMED` occupancy.
+- Staff and service must be active.
+- Staff must currently offer the service (`staff_services.active`). **Eligibility policy:** this check runs on both create and reschedule. Existing `CONFIRMED` appointments are not auto-cancelled if eligibility is later revoked.
+
+`setWorkingHours` is a tenant-scoped UPSERT on `(tenant_id, staff_id, day_of_week)`.
+
+New customers are created with `INSERT ... ON CONFLICT (tenant_id, phone_lookup_key_version, phone_lookup_hash) DO UPDATE` so concurrent first bookings for the same phone share one row.
+
+Catalog mutations (staff, service, staff-service assignment, working hours, breaks, time off) and appointment create/reschedule/cancel write `audit_events` in the same transaction.
 
 ## 9. Request path (after harness exists)
 

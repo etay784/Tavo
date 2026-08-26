@@ -119,6 +119,18 @@ export function civilGridStarts(
   return out;
 }
 
+export function isOnCivilGrid(
+  startAt: Date,
+  granularityMinutes: number,
+  timeZone: string,
+): boolean {
+  if (granularityMinutes <= 0) return false;
+  const dt = DateTime.fromJSDate(startAt, { zone: "utc" }).setZone(timeZone);
+  if (!dt.isValid) return false;
+  if (dt.second !== 0 || dt.millisecond !== 0) return false;
+  return (dt.hour * 60 + dt.minute) % granularityMinutes === 0;
+}
+
 function ceilToCivilGranularity(dt: DateTime, granularityMinutes: number): DateTime {
   const local = dt.set({ second: 0, millisecond: 0 });
   let minutesOfDay = local.hour * 60 + local.minute;

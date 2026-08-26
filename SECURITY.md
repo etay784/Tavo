@@ -81,6 +81,10 @@ Encryption rotation: decrypt with the row version; encrypt writes with current e
 
 No secrets in git. Local keys in ignored `.env`. Production later: managed secrets + KMS.
 
+Database role passwords are not stored in `packages/database/sql/` or `migrate.ts`. Tests use ephemeral PostgreSQL with local trust auth. `tavo_migrator` is never the API connection role.
+
+Secret scanning: gitleaks scans Git history reachable from HEAD (CI `fetch-depth: 0`) and the working tree. Do not allowlist entire application source files.
+
 ## 8. Logging and audit
 
 Structured logs with redaction. Mutations insert `audit_events` in the same transaction when practical. No phones, tokens, or keys in logs or audit metadata.

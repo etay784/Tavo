@@ -145,5 +145,33 @@ describe("api harness", () => {
     });
     expect(cancelled.statusCode).toBe(200);
     expect(cancelled.json().status).toBe("CANCELLED");
+
+    const offGrid = await appA.inject({
+      method: "POST",
+      url: "/v1/appointments",
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: {
+        staffId,
+        serviceId,
+        startAt: "2026-08-30T06:07:00.000Z",
+        customerPhone: "0507654321",
+      },
+    });
+    expect(offGrid.statusCode).toBe(400);
+    expect(offGrid.json().error.code).toBe("VALIDATION");
+
+    const beyond = await appA.inject({
+      method: "POST",
+      url: "/v1/appointments",
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: {
+        staffId,
+        serviceId,
+        startAt: "2026-09-24T06:00:00.000Z",
+        customerPhone: "0507654322",
+      },
+    });
+    expect(beyond.statusCode).toBe(400);
+    expect(beyond.json().error.code).toBe("VALIDATION");
   });
 });

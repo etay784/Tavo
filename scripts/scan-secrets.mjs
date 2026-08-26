@@ -61,9 +61,26 @@ async function ensureBinary() {
 }
 
 const bin = await ensureBinary();
-const result = execFileSync(
-  bin,
-  ["detect", "--source", ROOT, "--no-git", "--redact", "--config", path.join(ROOT, ".gitleaks.toml")],
-  { stdio: "inherit" },
-);
-void result;
+const config = path.join(ROOT, ".gitleaks.toml");
+
+function detect(args) {
+  execFileSync(bin, args, { stdio: "inherit", cwd: ROOT });
+}
+
+// Git history reachable from HEAD (CI uses fetch-depth: 0). Then the working tree
+// so uncommitted files are scanned too. Never rely on --no-git alone in CI.
+if (existsSync(path.join(ROOT, ".git"))) {
+  detect(["detect", "--source", ROOT, "--redact", "--config", config, "--exit-code", "1"]);
+}
+detect([
+  "detect",
+  "--source",
+  ROOT,
+  "--no-git",
+  "--redact",
+  "--config",
+  config,
+  "--exit-code",
+  "1",
+]);
+

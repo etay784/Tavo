@@ -104,13 +104,16 @@ export async function insertStaffService(
   staffId: string,
   serviceId: string,
 ) {
-  await client.query(
-    `INSERT INTO staff_services (tenant_id, staff_id, service_id) VALUES ($1,$2,$3)`,
+  const r = await client.query<{ id: string }>(
+    `INSERT INTO staff_services (tenant_id, staff_id, service_id) VALUES ($1,$2,$3)
+     ON CONFLICT (tenant_id, staff_id, service_id) DO UPDATE SET active = true
+     RETURNING id`,
     [tenantId, staffId, serviceId],
   );
+  return r.rows[0]!;
 }
 
-export async function insertWorkingHours(
+export async function upsertWorkingHours(
   client: PoolClient,
   tenantId: string,
   staffId: string,
@@ -118,12 +121,18 @@ export async function insertWorkingHours(
   startTime: string,
   endTime: string,
 ) {
-  await client.query(
+  const r = await client.query<{ id: string; start_time: string; end_time: string }>(
     `INSERT INTO working_hours (tenant_id, staff_id, day_of_week, start_time, end_time)
-     VALUES ($1,$2,$3,$4,$5)`,
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (tenant_id, staff_id, day_of_week)
+     DO UPDATE SET start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time, updated_at = now()
+     RETURNING id, start_time::text, end_time::text`,
     [tenantId, staffId, dayOfWeek, startTime, endTime],
   );
+  return r.rows[0]!;
 }
+
+export const insertWorkingHours = upsertWorkingHours;
 
 export async function insertBreak(
   client: PoolClient,
@@ -132,10 +141,11 @@ export async function insertBreak(
   startsAt: Date,
   endsAt: Date,
 ) {
-  await client.query(
-    `INSERT INTO breaks (tenant_id, staff_id, starts_at, ends_at) VALUES ($1,$2,$3,$4)`,
+  const r = await client.query<{ id: string }>(
+    `INSERT INTO breaks (tenant_id, staff_id, starts_at, ends_at) VALUES ($1,$2,$3,$4) RETURNING id`,
     [tenantId, staffId, startsAt, endsAt],
   );
+  return r.rows[0]!;
 }
 
 export async function insertTimeOff(
@@ -145,10 +155,11 @@ export async function insertTimeOff(
   startsAt: Date,
   endsAt: Date,
 ) {
-  await client.query(
-    `INSERT INTO time_off (tenant_id, staff_id, starts_at, ends_at) VALUES ($1,$2,$3,$4)`,
+  const r = await client.query<{ id: string }>(
+    `INSERT INTO time_off (tenant_id, staff_id, starts_at, ends_at) VALUES ($1,$2,$3,$4) RETURNING id`,
     [tenantId, staffId, startsAt, endsAt],
   );
+  return r.rows[0]!;
 }
 
 export async function getService(client: PoolClient, tenantId: string, serviceId: string) {
@@ -267,7 +278,7 @@ export async function findCustomerByLookup(
   return r.rows[0];
 }
 
-export async function insertCustomer(
+export async function upsertCustomer(
   client: PoolClient,
   tenantId: string,
   input: {
@@ -278,12 +289,21 @@ export async function insertCustomer(
     phoneLookupKeyVersion: number;
   },
 ) {
-  const r = await client.query<{ id: string }>(
+  const r = await client.query<{
+    id: string;
+    name: string | null;
+    phone_encrypted: string;
+    phone_encryption_key_version: number;
+  }>(
     `INSERT INTO customers (
        tenant_id, name, phone_encrypted, phone_encryption_key_version,
        phone_lookup_hash, phone_lookup_key_version, last_seen_at
      ) VALUES ($1,$2,$3,$4,$5,$6, now())
-     RETURNING id`,
+     ON CONFLICT (tenant_id, phone_lookup_key_version, phone_lookup_hash)
+     DO UPDATE SET
+       last_seen_at = now(),
+       name = COALESCE(EXCLUDED.name, customers.name)
+     RETURNING id, name, phone_encrypted, phone_encryption_key_version`,
     [
       tenantId,
       input.name,
@@ -295,6 +315,8 @@ export async function insertCustomer(
   );
   return r.rows[0]!;
 }
+
+export const insertCustomer = upsertCustomer;
 
 export async function insertAppointment(
   client: PoolClient,

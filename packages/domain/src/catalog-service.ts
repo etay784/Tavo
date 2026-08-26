@@ -61,7 +61,16 @@ export class CatalogService {
 
   async assignService(ctx: TrustedTenantContext, staffId: string, serviceId: string) {
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      await insertStaffService(client, ctx.tenantId, staffId, serviceId);
+      const row = await insertStaffService(client, ctx.tenantId, staffId, serviceId);
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "staff_service.assigned",
+        objectType: "staff_service",
+        objectId: row.id,
+        metadata: { staffId, serviceId },
+      });
+      return row;
     });
   }
 
@@ -73,19 +82,46 @@ export class CatalogService {
     endTime: string,
   ) {
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      await insertWorkingHours(client, ctx.tenantId, staffId, dayOfWeek, startTime, endTime);
+      const row = await insertWorkingHours(client, ctx.tenantId, staffId, dayOfWeek, startTime, endTime);
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "working_hours.set",
+        objectType: "working_hours",
+        objectId: row.id,
+        metadata: { staffId, dayOfWeek },
+      });
+      return row;
     });
   }
 
   async addBreak(ctx: TrustedTenantContext, staffId: string, startsAt: Date, endsAt: Date) {
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      await insertBreak(client, ctx.tenantId, staffId, startsAt, endsAt);
+      const row = await insertBreak(client, ctx.tenantId, staffId, startsAt, endsAt);
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "break.created",
+        objectType: "break",
+        objectId: row.id,
+        metadata: { staffId },
+      });
+      return row;
     });
   }
 
   async addTimeOff(ctx: TrustedTenantContext, staffId: string, startsAt: Date, endsAt: Date) {
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      await insertTimeOff(client, ctx.tenantId, staffId, startsAt, endsAt);
+      const row = await insertTimeOff(client, ctx.tenantId, staffId, startsAt, endsAt);
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "time_off.created",
+        objectType: "time_off",
+        objectId: row.id,
+        metadata: { staffId },
+      });
+      return row;
     });
   }
 }

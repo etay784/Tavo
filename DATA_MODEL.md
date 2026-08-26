@@ -41,7 +41,15 @@ This applies to locations, staff, services, staff_services, working_hours, break
 
 `locations`, `staff_members`, `services` (duration, `price_minor`, unused deposit columns, buffers), `staff_services`, `working_hours` (`day_of_week` 0 = Sunday … 6 = Saturday, civil `start_time`/`end_time` in the **business** timezone), `breaks`, `time_off`.
 
-Working-hours civil times are interpreted in `businesses.timezone` unless a later location override exists. The engine converts each calendar date to UTC instants.
+Working-hours civil times are interpreted in `businesses.timezone` unless a later location override exists. The engine converts each calendar date to UTC instants. `UNIQUE (tenant_id, staff_id, day_of_week)` is updated in place by `setWorkingHours` (UPSERT).
+
+### Eligibility (`staff_services`)
+
+Create and reschedule require an **active** `staff_services` row for that staff and service, plus active staff and service rows. Revoking eligibility (inactive row or missing assignment) causes later create/reschedule to fail. Existing `CONFIRMED` appointments are not rewritten or cancelled by that change.
+
+### `schema_migrations`
+
+Filename primary key, `applied_at`. Not tenant-scoped. Owned by `tavo_migrator`; no DML grants to `tavo_app`. SQL files under `packages/database/sql/` remain the schema source of truth.
 
 ### `customers`
 
@@ -53,7 +61,7 @@ Working-hours civil times are interpreted in `businesses.timezone` unless a late
 | `phone_lookup_key_version` | HMAC key version that produced the lookup value |
 | `name`, `last_seen_at` | |
 
-`UNIQUE (tenant_id, phone_lookup_key_version, phone_lookup_hash)`.
+`UNIQUE (tenant_id, phone_lookup_key_version, phone_lookup_hash)`. First-seen customers are created with `INSERT ... ON CONFLICT` on that key so concurrent bookings for the same unseen phone share one row.
 
 **HMAC rotation (Phase 1 behavior, no rotator service):**
 

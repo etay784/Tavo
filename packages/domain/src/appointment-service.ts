@@ -10,8 +10,7 @@ import {
   getStaff,
   insertAppointment,
   insertAudit,
-  insertCustomer,
-  staffOffersService,
+  upsertCustomer,
   updateAppointmentSchedule,
   withTenant,
 } from "@tavo/database";
@@ -37,39 +36,24 @@ export class AppointmentService {
   ) {
     const normalized = normalizePhone(input.customerPhone);
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      const staff = await getStaff(client, ctx.tenantId, input.staffId);
-      if (!staff || !staff.active) throw Errors.notFound("staff");
-      const eligible = await staffOffersService(
-        client,
-        ctx.tenantId,
-        input.staffId,
-        input.serviceId,
-      );
-      if (!eligible) throw Errors.validation("staff does not offer this service");
       const { occupancy, service } = await this.scheduling.assertSlotAvailableOnClient(
         client,
         ctx,
         { serviceId: input.serviceId, staffId: input.staffId, startAt: input.startAt },
       );
+      const staff = await getStaff(client, ctx.tenantId, input.staffId);
+      if (!staff) throw Errors.notFound("staff");
       const candidates = lookupCandidates(normalized, this.phones.hmacKeyring);
       let customer = await findCustomerByLookup(client, ctx.tenantId, candidates);
       if (!customer) {
         const sealed = sealPhone(normalized, this.phones);
-        customer = {
-          ...sealed,
-          id: (
-            await insertCustomer(client, ctx.tenantId, {
-              name: input.customerName ?? null,
-              phoneEncrypted: sealed.phoneEncrypted,
-              phoneEncryptionKeyVersion: sealed.phoneEncryptionKeyVersion,
-              phoneLookupHash: sealed.phoneLookupHash,
-              phoneLookupKeyVersion: sealed.phoneLookupKeyVersion,
-            })
-          ).id,
+        customer = await upsertCustomer(client, ctx.tenantId, {
           name: input.customerName ?? null,
-          phone_encrypted: sealed.phoneEncrypted,
-          phone_encryption_key_version: sealed.phoneEncryptionKeyVersion,
-        };
+          phoneEncrypted: sealed.phoneEncrypted,
+          phoneEncryptionKeyVersion: sealed.phoneEncryptionKeyVersion,
+          phoneLookupHash: sealed.phoneLookupHash,
+          phoneLookupKeyVersion: sealed.phoneLookupKeyVersion,
+        });
       }
       const row = await insertAppointment(client, ctx.tenantId, {
         customerId: customer.id,

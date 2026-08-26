@@ -4,15 +4,18 @@ import { Errors, addMinutes } from "@tavo/shared";
 import {
   getBusiness,
   getService,
+  getStaff,
   listBreaks,
   listEligibleStaff,
   listOccupied,
   listTimeOff,
   listWorkingHours,
+  staffOffersService,
   withTenant,
 } from "@tavo/database";
 import {
   candidateStarts,
+  isOnCivilGrid,
   occupancySnapshot,
   slotFits,
   subtractBusy,
@@ -104,6 +107,27 @@ export class SchedulingService {
     if (!business) throw Errors.notFound("business");
     const service = await getService(client, ctx.tenantId, input.serviceId);
     if (!service || !service.active) throw Errors.notFound("service");
+    const staff = await getStaff(client, ctx.tenantId, input.staffId);
+    if (!staff || !staff.active) throw Errors.notFound("staff");
+    const eligible = await staffOffersService(
+      client,
+      ctx.tenantId,
+      input.staffId,
+      input.serviceId,
+    );
+    if (!eligible) {
+      throw Errors.validation("staff does not offer this service");
+    }
+    if (!isOnCivilGrid(input.startAt, business.slot_granularity_minutes, business.timezone)) {
+      throw Errors.validation("start is not aligned to the configured slot grid");
+    }
+    const now = this.clock.now();
+    if (input.startAt < addMinutes(now, business.min_advance_minutes)) {
+      throw Errors.validation("start is inside the minimum advance notice");
+    }
+    if (input.startAt >= addMinutes(now, business.booking_horizon_days * 24 * 60)) {
+      throw Errors.validation("start is beyond the booking horizon");
+    }
     const occ = occupancySnapshot(
       input.startAt,
       service.duration_minutes,
@@ -128,10 +152,6 @@ export class SchedulingService {
       })
     ) {
       throw Errors.slotNoLongerAvailable();
-    }
-    const now = this.clock.now();
-    if (input.startAt < addMinutes(now, business.min_advance_minutes)) {
-      throw Errors.validation("start is inside the minimum advance notice");
     }
     return { business, service, occupancy: occ };
   }
