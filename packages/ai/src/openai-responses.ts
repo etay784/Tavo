@@ -44,13 +44,24 @@ function dropNulls(value: unknown): unknown {
 function catalogBlock(context: MinContext): string {
   const services = context.services.map((s) => s.name).join(", ");
   const staff = context.staff.map((s) => s.name).join(", ");
-  return [
+  const lines = [
     `conversation_state=${context.conversation_state}`,
     `timezone=${context.timezone}`,
     `now_civil=${context.now_civil}`,
     `services=${services}`,
     `staff=${staff}`,
-  ].join("\n");
+  ];
+  if (context.offered_options?.length) {
+    lines.push(
+      `offered_options=${context.offered_options.map((o) => `${o.ordinal}) ${o.label}`).join("; ")}`,
+    );
+  }
+  if (context.appointment_options?.length) {
+    lines.push(
+      `appointment_options=${context.appointment_options.map((o) => `${o.ordinal}) ${o.label}`).join("; ")}`,
+    );
+  }
+  return lines.join("\n");
 }
 
 function extractOutputText(body: unknown): string {
