@@ -1,4 +1,13 @@
 import { z } from "zod";
+import { resolveTwelveHour, parseHeClock, clockFieldsFromParse } from "./he-clock";
+
+export {
+  parseHeClock,
+  overlayHeClock,
+  resolveTwelveHour,
+  clockFieldsFromParse,
+} from "./he-clock";
+export type { ClockRelation, DayPart, ParsedHeClock } from "./he-clock";
 
 export const ConversationStateSchema = z.enum([
   "IDLE",
@@ -75,6 +84,9 @@ export const IntentSchema = z
     time_exact: CivilTimeSchema.optional(),
     time_from: CivilTimeSchema.optional(),
     time_to: CivilTimeSchema.optional(),
+    clock_hour: z.number().int().min(1).max(12).optional(),
+    clock_minute: z.number().int().min(0).max(59).optional(),
+    clock_relation: z.enum(["AFTER", "BEFORE", "AROUND", "AT"]).optional(),
   })
   .strict();
 
@@ -90,6 +102,9 @@ export const PendingRequestSchema = z
     time_from: CivilTimeSchema.optional(),
     time_to: CivilTimeSchema.optional(),
     staff_name: z.string().min(1).max(80).optional(),
+    clock_hour: z.number().int().min(1).max(12).optional(),
+    clock_minute: z.number().int().min(0).max(59).optional(),
+    clock_relation: z.enum(["AFTER", "BEFORE", "AROUND", "AT"]).optional(),
   })
   .strict();
 
@@ -105,6 +120,9 @@ export function extractPendingRequest(parsed: StructuredIntent): PendingRequest 
   if (parsed.time_from) next.time_from = parsed.time_from;
   if (parsed.time_to) next.time_to = parsed.time_to;
   if (parsed.staff_name) next.staff_name = parsed.staff_name;
+  if (parsed.clock_hour !== undefined) next.clock_hour = parsed.clock_hour;
+  if (parsed.clock_minute !== undefined) next.clock_minute = parsed.clock_minute;
+  if (parsed.clock_relation) next.clock_relation = parsed.clock_relation;
   return next;
 }
 
@@ -190,7 +208,46 @@ export function mergePendingRequest(
   }
 
   if (extracted.staff_name) base.staff_name = extracted.staff_name;
+
+  if (extracted.clock_hour !== undefined && extracted.clock_relation) {
+    base.clock_hour = extracted.clock_hour;
+    base.clock_relation = extracted.clock_relation;
+    if (extracted.clock_minute !== undefined) base.clock_minute = extracted.clock_minute;
+    else delete base.clock_minute;
+    if (!hasFrom) delete base.time_from;
+    if (!hasTo) delete base.time_to;
+    if (!hasExact) delete base.time_exact;
+    if (!hasWindow) delete base.time_window;
+  } else if (hasFrom || hasTo || hasExact) {
+    delete base.clock_hour;
+    delete base.clock_minute;
+    delete base.clock_relation;
+  }
+
+  resolveStoredClock(base);
   return Object.keys(base).length ? base : null;
+}
+
+function resolveStoredClock(base: PendingRequest): void {
+  if (base.clock_hour === undefined || !base.clock_relation || !base.time_window) return;
+  const hm = resolveTwelveHour(base.clock_hour, base.clock_minute ?? 0, base.time_window);
+  if (base.clock_relation === "AFTER") {
+    base.time_from = hm;
+    delete base.time_to;
+    delete base.time_exact;
+  } else if (base.clock_relation === "BEFORE") {
+    base.time_to = hm;
+    delete base.time_from;
+    delete base.time_exact;
+  } else {
+    base.time_exact = hm;
+    delete base.time_from;
+    delete base.time_to;
+  }
+  delete base.clock_hour;
+  delete base.clock_minute;
+  delete base.clock_relation;
+  delete base.time_window;
 }
 
 export type IntentExtractionInput = {
@@ -220,11 +277,6 @@ async function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function padHm(value: string): string {
-  const [h, m] = value.split(":");
-  return `${(h ?? "0").padStart(2, "0")}:${m ?? "00"}`;
-}
-
 function availabilityHints(t: string, context: MinContext): Partial<StructuredIntent> {
   const hints: Partial<StructuredIntent> = {};
   if (t.includes("בוקר")) hints.time_window = "MORNING";
@@ -241,15 +293,26 @@ function availabilityHints(t: string, context: MinContext): Partial<StructuredIn
     (s) => t.includes(s.name.toLowerCase()) || (s.name.toLowerCase() === "daniel" && t.includes("דניאל")),
   );
   if (staff) hints.staff_name = staff.name;
-  const exact =
-    t.match(/בשעה\s+(\d{1,2}:\d{2})/) ??
-    t.match(/exactly\s+(\d{1,2}:\d{2})/) ??
-    t.match(/at\s+(\d{1,2}:\d{2})/);
-  if (exact) hints.time_exact = padHm(exact[1]!);
-  const after = t.match(/אחרי\s+(\d{1,2}:\d{2})/) ?? t.match(/after\s+(\d{1,2}:\d{2})/);
-  const before = t.match(/לפני\s+(\d{1,2}:\d{2})/) ?? t.match(/before\s+(\d{1,2}:\d{2})/);
-  if (after) hints.time_from = padHm(after[1]!);
-  if (before) hints.time_to = padHm(before[1]!);
+  const clock = parseHeClock(t);
+  if (clock) {
+    const fields = clockFieldsFromParse(clock);
+    if (clock.kind === "twelve" && !clock.window) {
+      delete hints.time_from;
+      delete hints.time_to;
+      delete hints.time_exact;
+      delete hints.time_window;
+    }
+    if (clock.kind === "civil" || (clock.kind === "twelve" && clock.window)) {
+      delete hints.time_window;
+      delete hints.time_from;
+      delete hints.time_to;
+      delete hints.time_exact;
+      delete hints.clock_hour;
+      delete hints.clock_minute;
+      delete hints.clock_relation;
+    }
+    Object.assign(hints, fields);
+  }
   return hints;
 }
 
@@ -307,6 +370,21 @@ export class FakeAIProvider implements AIProvider {
     if (t.includes("התור") || t.includes("התורים")) {
       return { intent: "GET_BOOKING", confidence: 0.9 };
     }
+    const clockAsk = parseHeClock(t);
+    if (clockAsk && (clockAsk.kind === "twelve" || clockAsk.kind === "civil")) {
+      return {
+        intent: "FIND_AVAILABILITY",
+        confidence: 0.9,
+        relative_when:
+          t.includes("השבוע") || t.includes("this week")
+            ? "THIS_WEEK"
+            : t.includes("מחר")
+              ? "TOMORROW"
+              : undefined,
+        ...availabilityHints(t, input.context),
+        ...(t.includes("תספורת") ? { service_name: "תספורת" } : {}),
+      };
+    }
     const ordinal = ordinalFromText(t);
     if (state === "AWAITING_STAFF") {
       const named = input.context.staff.find(
@@ -316,7 +394,7 @@ export class FakeAIProvider implements AIProvider {
         return { intent: "SELECT_STAFF", confidence: 0.9, staff_name: named.name };
       }
       const hints = availabilityHints(t, input.context);
-      if (hints.time_window || hints.relative_when || hints.weekday || hints.civil_date || hints.time_from || hints.time_to) {
+      if (hints.time_window || hints.relative_when || hints.weekday || hints.civil_date || hints.time_from || hints.time_to || hints.clock_hour) {
         return { intent: "FIND_AVAILABILITY", confidence: 0.9, ...hints };
       }
       return { intent: "CLARIFY", confidence: 0.7 };
@@ -360,6 +438,7 @@ export class FakeAIProvider implements AIProvider {
       t.includes("משהו") ||
       t.includes("לפני") ||
       t.includes("אחרי") ||
+      t.includes("סביב") ||
       t.includes("בעצם") ||
       t.includes("בשעה") ||
       t.includes("before") ||

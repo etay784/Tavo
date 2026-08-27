@@ -1126,4 +1126,86 @@ describe("phase 2A whatsapp worker", () => {
     expect(stored.relative_when).toBe("TOMORROW");
     ai.nextIntent = null;
   });
+
+  it("asks morning vs evening for ambiguous 12-hour times and continues after בערב", async () => {
+    ai.nextIntent = null;
+    const from = "972500100030";
+    const before = fakeWa.sent.length;
+    const raw1 = JSON.stringify(textPayload("wamid-clock-1", "תספורת אחרי 7", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    expect(await runInboundOnce(pool, "w-clock", processor)).toBe(true);
+    expect(await runOutboundOnce(pool, "w-clock", phoneKeys, messages, fakeWa)).toBe(true);
+    expect(fakeWa.sent.length).toBe(before + 1);
+    const ask = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(ask).toBe("התכוונת אחרי 7 בבוקר או אחרי 7 בערב?");
+    expect(ask).not.toContain("זמין:");
+    const storedClock = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ pending_request: { clock_hour?: number; clock_relation?: string; time_from?: string } }>(
+        `SELECT conv.pending_request
+         FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-clock-1'`,
+      );
+      return r.rows[0]!.pending_request;
+    });
+    expect(storedClock.clock_hour).toBe(7);
+    expect(storedClock.clock_relation).toBe("AFTER");
+    expect(storedClock.time_from).toBeUndefined();
+    const raw2 = JSON.stringify(textPayload("wamid-clock-2", "בערב", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    expect(await runInboundOnce(pool, "w-clock", processor)).toBe(true);
+    expect(await runOutboundOnce(pool, "w-clock", phoneKeys, messages, fakeWa)).toBe(true);
+    expect(fakeWa.sent.length).toBe(before + 2);
+    const offer = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(offer).toContain("זמין:");
+    const hours = [...offer.matchAll(/(\d)\) (\d{2}):(\d{2}) אצל/g)].map((m) => Number(m[2]));
+    expect(hours.length).toBeGreaterThan(0);
+    expect(hours.every((h) => h >= 19)).toBe(true);
+  });
+
+  it("does not ask when the 12-hour hour already has a daypart or a 24-hour time", async () => {
+    ai.nextIntent = null;
+    const send = async (wamid: string, body: string, from: string) => {
+      const before = fakeWa.sent.length;
+      const raw = JSON.stringify(textPayload(wamid, body, from));
+      await persistParsedWebhook(pool, Buffer.from(raw), JSON.parse(raw), messages, routingKey);
+      expect(await runInboundOnce(pool, "w-clock", processor)).toBe(true);
+      expect(await runOutboundOnce(pool, "w-clock", phoneKeys, messages, fakeWa)).toBe(true);
+      expect(fakeWa.sent.length).toBe(before + 1);
+      return fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    };
+
+    const eve = await send("wamid-clock-eve", "תספורת אחרי 7 בערב", "972500100031");
+    expect(eve).not.toContain("התכוונת");
+    expect(eve).toContain("זמין:");
+    const eveHours = [...eve.matchAll(/(\d)\) (\d{2}):(\d{2}) אצל/g)].map((m) => Number(m[2]));
+    expect(eveHours.every((h) => h >= 19)).toBe(true);
+
+    const morn = await send("wamid-clock-morn", "תספורת אחרי 7 בבוקר", "972500100032");
+    expect(morn).not.toContain("התכוונת");
+    expect(morn).toContain("זמין:");
+
+    const civil = await send("wamid-clock-19", "תספורת אחרי 19:00", "972500100033");
+    expect(civil).not.toContain("התכוונת");
+    const civilHours = [...civil.matchAll(/(\d)\) (\d{2}):(\d{2}) אצל/g)].map((m) => Number(m[2]));
+    expect(civilHours.every((h) => h >= 19)).toBe(true);
+
+    expect(await send("wamid-clock-at7", "תספורת ב-7 מחר", "972500100038")).toBe(
+      "התכוונת ב-7 בבוקר או ב-7 בערב?",
+    );
+    expect(await send("wamid-clock-at8", "תספורת ב-8 מחר", "972500100034")).toBe(
+      "התכוונת ב-8 בבוקר או ב-8 בערב?",
+    );
+    expect(await send("wamid-clock-before", "תספורת לפני 8", "972500100035")).toBe(
+      "התכוונת לפני 8 בבוקר או לפני 8 בערב?",
+    );
+    expect(await send("wamid-clock-around", "תספורת סביב 9", "972500100036")).toBe(
+      "התכוונת סביב 9 בבוקר או סביב 9 בערב?",
+    );
+
+    const exact = await send("wamid-clock-20", "תספורת ב-20:00", "972500100037");
+    expect(exact).toContain("20:00");
+    expect(exact).not.toContain("התכוונת");
+    expect(exact).not.toContain("20:15");
+  });
 });

@@ -6,6 +6,7 @@ import {
   PAYMENT_UNAVAILABLE_HE,
   formatAvailabilityList,
   formatBookingConfirmation,
+  formatClockClarification,
 } from "./formatters";
 
 describe("deterministic formatters", () => {
@@ -33,6 +34,21 @@ describe("deterministic formatters", () => {
   it("does not claim a human received the message", () => {
     expect(FALLBACK_HE).not.toMatch(/הועבר|נציג|בעל העסק קיבל/);
     expect(PAYMENT_UNAVAILABLE_HE).not.toMatch(/הועבר/);
+  });
+
+  it("asks morning vs evening for an ambiguous 12-hour clock", () => {
+    expect(formatClockClarification({ relation: "AFTER", hour: 7 })).toBe(
+      "התכוונת אחרי 7 בבוקר או אחרי 7 בערב?",
+    );
+    expect(formatClockClarification({ relation: "AT", hour: 8 })).toBe(
+      "התכוונת ב-8 בבוקר או ב-8 בערב?",
+    );
+    expect(formatClockClarification({ relation: "BEFORE", hour: 8 })).toBe(
+      "התכוונת לפני 8 בבוקר או לפני 8 בערב?",
+    );
+    expect(formatClockClarification({ relation: "AROUND", hour: 9 })).toBe(
+      "התכוונת סביב 9 בבוקר או סביב 9 בערב?",
+    );
   });
 });
 

@@ -57,6 +57,7 @@ import {
   PendingRequestSchema,
   RouteLabelSchema,
   mergePendingRequest,
+  overlayHeClock,
   type AIProvider,
   type MinContext,
   type PendingRequest,
@@ -84,6 +85,7 @@ import {
   formatRescheduleConfirmation,
   formatServiceChoices,
   NO_BOOKING_HE,
+  formatClockClarification,
 } from "./formatters";
 
 export type MessageCrypto = {
@@ -748,7 +750,10 @@ export class InboundProcessor {
     let parsed: StructuredIntent;
     try {
       parsed = IntentSchema.parse(
-        await this.ai.extractIntent({ userText: prepared.text, context: minContext, signal }),
+        overlayHeClock(
+          await this.ai.extractIntent({ userText: prepared.text, context: minContext, signal }),
+          prepared.text,
+        ),
       );
     } catch {
       if (signal.aborted) throw new Error("orchestrator deadline");
@@ -960,6 +965,30 @@ export class InboundProcessor {
       };
     }
     const staffHint = "ok" in staffResolved ? staffResolved.ok : undefined;
+    const pendingWithStaff = staffHint ? { ...(pending ?? {}), staff_name: staffHint.name } : pending;
+    if (
+      pendingWithStaff?.clock_hour !== undefined &&
+      pendingWithStaff.clock_relation &&
+      !pendingWithStaff.time_from &&
+      !pendingWithStaff.time_to &&
+      !pendingWithStaff.time_exact
+    ) {
+      return {
+        facts: formatClockClarification({
+          relation: pendingWithStaff.clock_relation,
+          hour: pendingWithStaff.clock_hour,
+          ...(pendingWithStaff.clock_minute !== undefined
+            ? { minute: pendingWithStaff.clock_minute }
+            : {}),
+        }),
+        state: prepared.pendingAppointmentId ? "AWAITING_RESCHEDULE_SLOT" : "IDLE",
+        serviceId: service.id,
+        pendingAppointmentId: prepared.pendingAppointmentId ?? null,
+        offerSetId: null,
+        pendingRequest: pendingWithStaff,
+        intent: parsed.intent,
+      };
+    }
     const relative =
       pending?.relative_when ??
       parsed.relative_when ??

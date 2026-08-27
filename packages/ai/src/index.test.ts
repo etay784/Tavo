@@ -79,6 +79,58 @@ describe("FakeAIProvider", () => {
     expect(parsed.intent).toBe("SELECT_STAFF");
     expect(parsed.staff_name).toBe("Daniel");
   });
+
+  it("does not guess morning or evening for bare 12-hour clock phrases", async () => {
+    const ai = new FakeAIProvider();
+    const after7 = IntentSchema.parse(await ai.extractIntent({ userText: "אחרי 7", context: ctx }));
+    expect(after7.intent).toBe("FIND_AVAILABILITY");
+    expect(after7.clock_hour).toBe(7);
+    expect(after7.clock_relation).toBe("AFTER");
+    expect(after7.time_from).toBeUndefined();
+    expect(after7.time_window).toBeUndefined();
+
+    const withService = IntentSchema.parse(
+      await ai.extractIntent({ userText: "תספורת אחרי 7", context: ctx }),
+    );
+    expect(withService.clock_hour).toBe(7);
+    expect(withService.clock_relation).toBe("AFTER");
+    expect(withService.time_from).toBeUndefined();
+    expect(withService.service_name).toBe("תספורת");
+
+    const at7 = IntentSchema.parse(await ai.extractIntent({ userText: "ב-7", context: ctx }));
+    expect(at7.clock_hour).toBe(7);
+    expect(at7.clock_relation).toBe("AT");
+    expect(at7.time_exact).toBeUndefined();
+
+    const before8 = IntentSchema.parse(await ai.extractIntent({ userText: "לפני 8", context: ctx }));
+    expect(before8.clock_hour).toBe(8);
+    expect(before8.clock_relation).toBe("BEFORE");
+    expect(before8.time_to).toBeUndefined();
+
+    const around9 = IntentSchema.parse(await ai.extractIntent({ userText: "סביב 9", context: ctx }));
+    expect(around9.clock_hour).toBe(9);
+    expect(around9.clock_relation).toBe("AROUND");
+  });
+
+  it("resolves 12-hour hours only when a daypart or 24-hour time is present", async () => {
+    const ai = new FakeAIProvider();
+    const eve = IntentSchema.parse(await ai.extractIntent({ userText: "אחרי 7 בערב", context: ctx }));
+    expect(eve.time_from).toBe("19:00");
+    expect(eve.clock_hour).toBeUndefined();
+    expect(eve.time_window).toBeUndefined();
+
+    const morn = IntentSchema.parse(await ai.extractIntent({ userText: "אחרי 7 בבוקר", context: ctx }));
+    expect(morn.time_from).toBe("07:00");
+    expect(morn.clock_hour).toBeUndefined();
+
+    const civil = IntentSchema.parse(await ai.extractIntent({ userText: "אחרי 19:00", context: ctx }));
+    expect(civil.time_from).toBe("19:00");
+    expect(civil.clock_hour).toBeUndefined();
+
+    const exact = IntentSchema.parse(await ai.extractIntent({ userText: "ב-20:00", context: ctx }));
+    expect(exact.time_exact).toBe("20:00");
+    expect(exact.clock_hour).toBeUndefined();
+  });
 });
 
 describe("mergePendingRequest", () => {
@@ -113,6 +165,28 @@ describe("mergePendingRequest", () => {
     expect(merged?.time_window).toBe("MORNING");
     expect(merged?.time_from).toBeUndefined();
     expect(merged?.weekday).toBe("THU");
+  });
+
+  it("resolves אחרי 7 after the user says בערב", () => {
+    const merged = mergePendingRequest(
+      { clock_hour: 7, clock_relation: "AFTER" },
+      find({ time_window: "EVENING" }),
+    );
+    expect(merged?.time_from).toBe("19:00");
+    expect(merged?.clock_hour).toBeUndefined();
+    expect(merged?.clock_relation).toBeUndefined();
+    expect(merged?.time_window).toBeUndefined();
+  });
+
+  it("does not resolve a 12-hour clock from a leftover daypart", () => {
+    const merged = mergePendingRequest(
+      { time_window: "EVENING" },
+      find({ clock_hour: 7, clock_relation: "AFTER" }),
+    );
+    expect(merged?.clock_hour).toBe(7);
+    expect(merged?.clock_relation).toBe("AFTER");
+    expect(merged?.time_from).toBeUndefined();
+    expect(merged?.time_window).toBeUndefined();
   });
 });
 

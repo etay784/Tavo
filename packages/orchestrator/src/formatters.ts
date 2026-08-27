@@ -12,6 +12,26 @@ export const CLARIFY_SERVICE_HE = "לא מצאתי שירות בשם הזה. א�
 export const AMBIGUOUS_SERVICE_HE = "יש כמה שירותים דומים. אפשר לבחור מספר מהרשימה?";
 export const NO_AVAILABILITY_HE = "אין תורים בזמן המבוקש. אפשר לבחור זמן אחר.";
 
+export function formatClockClarification(input: {
+  relation: "AFTER" | "BEFORE" | "AROUND" | "AT";
+  hour: number;
+  minute?: number;
+}): string {
+  const n =
+    input.minute && input.minute > 0
+      ? `${input.hour}:${String(input.minute).padStart(2, "0")}`
+      : String(input.hour);
+  const phrase =
+    input.relation === "AFTER"
+      ? `אחרי ${n}`
+      : input.relation === "BEFORE"
+        ? `לפני ${n}`
+        : input.relation === "AROUND"
+          ? `סביב ${n}`
+          : `ב-${n}`;
+  return `התכוונת ${phrase} בבוקר או ${phrase} בערב?`;
+}
+
 export function formatOfferedOptionLabel(
   startAt: Date,
   staffName: string,

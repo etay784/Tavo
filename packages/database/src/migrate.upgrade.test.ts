@@ -83,6 +83,15 @@ describe("versioned migrations", () => {
           svc.rows[0]!.id,
         ],
       );
+      await check.query(
+        `INSERT INTO conversations (tenant_id, customer_id, pending_request)
+         VALUES ($1, $2, $3::jsonb)`,
+        [
+          "dddddddd-dddd-dddd-dddd-dddddddddddd",
+          cust.rows[0]!.id,
+          JSON.stringify({ clock_hour: 7, clock_relation: "AFTER" }),
+        ],
+      );
     } finally {
       await check.end();
     }

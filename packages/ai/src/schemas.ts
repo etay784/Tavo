@@ -51,6 +51,11 @@ export const INTENT_JSON_SCHEMA = {
     time_exact: civilTime,
     time_from: civilTime,
     time_to: civilTime,
+    clock_hour: { anyOf: [{ type: "integer", minimum: 1, maximum: 12 }, { type: "null" }] },
+    clock_minute: { anyOf: [{ type: "integer", minimum: 0, maximum: 59 }, { type: "null" }] },
+    clock_relation: {
+      anyOf: [{ type: "string", enum: ["AFTER", "BEFORE", "AROUND", "AT"] }, { type: "null" }],
+    },
   },
   required: [
     "intent",
@@ -66,6 +71,9 @@ export const INTENT_JSON_SCHEMA = {
     "time_exact",
     "time_from",
     "time_to",
+    "clock_hour",
+    "clock_minute",
+    "clock_relation",
   ],
 } as const;
 

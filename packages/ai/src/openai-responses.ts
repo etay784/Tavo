@@ -18,7 +18,8 @@ const RECEPTIONIST_INSTRUCTIONS = [
   "Use CLARIFY when the booking ask is incomplete.",
   "Do not invent prices, slots, identity, or tenant identifiers.",
   "service_name and staff_name must be copied from the provided catalog names or null.",
-  "Never include keys outside the schema.",
+  "Never guess morning vs evening for 12-hour hours 1-12. If the customer said אחרי/לפני/סביב/ב- with a bare hour and no בוקר/ערב and no HH:mm, set clock_hour and clock_relation and leave time_from/time_to/time_exact null.",
+  "HH:mm and hours 13-23 are 24-hour civil times. Do not use opening hours to guess AM/PM.",
 ].join(" ");
 
 const ROUTER_INSTRUCTIONS = [
