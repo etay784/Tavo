@@ -96,23 +96,28 @@ describe("receptionist gold against FakeAI (CI smoke)", () => {
 });
 
 describe.skipIf(process.env.TAVO_REAL_AI_EVAL !== "1")("frozen Hebrew gold against OpenAI Responses", () => {
-  it("selects the first candidate model that passes receptionist gates", async () => {
-    const apiKey = process.env.OPENAI_API_KEY;
-    expect(apiKey, "OPENAI_API_KEY required for TAVO_REAL_AI_EVAL=1").toBeTruthy();
-    const results: Score[] = [];
-    let selected: Score | undefined;
-    for (const model of EVAL_MODEL_CANDIDATES) {
-      const provider = new OpenAIResponsesProvider({ apiKey: apiKey!, model });
-      const s = await scoreProvider(model, (text, state) =>
-        provider.extractIntent({ userText: text, context: ctx(state) }),
-      );
-      results.push(s);
-      if (passGates(s)) {
-        selected = s;
-        break;
+  it(
+    "selects the first candidate model that passes receptionist gates",
+    { timeout: 180_000 },
+    async ({ signal }) => {
+      const apiKey = process.env.OPENAI_API_KEY;
+      expect(apiKey, "OPENAI_API_KEY required for TAVO_REAL_AI_EVAL=1").toBeTruthy();
+      const results: Score[] = [];
+      let selected: Score | undefined;
+      for (const model of EVAL_MODEL_CANDIDATES) {
+        if (signal.aborted) break;
+        const provider = new OpenAIResponsesProvider({ apiKey: apiKey!, model });
+        const s = await scoreProvider(model, (text, state) =>
+          provider.extractIntent({ userText: text, context: ctx(state), signal }),
+        );
+        results.push(s);
+        if (passGates(s)) {
+          selected = s;
+          break;
+        }
       }
-    }
-    console.log(JSON.stringify({ selected: selected?.model ?? null, results }, null, 2));
-    expect(selected, "no candidate passed receptionist gates").toBeTruthy();
-  });
+      console.log(JSON.stringify({ selected: selected?.model ?? null, results }, null, 2));
+      expect(selected, "no candidate passed receptionist gates").toBeTruthy();
+    },
+  );
 });
