@@ -10,6 +10,7 @@ export const CLARIFY_STAFF_HE = "לא מצאתי איש צוות בשם הזה. 
 export const AMBIGUOUS_STAFF_HE = "יש כמה אנשי צוות דומים. אפשר לכתוב את השם המלא?";
 export const CLARIFY_SERVICE_HE = "לא מצאתי שירות בשם הזה. אפשר לבחור מהרשימה?";
 export const AMBIGUOUS_SERVICE_HE = "יש כמה שירותים דומים. אפשר לבחור מספר מהרשימה?";
+export const NO_AVAILABILITY_HE = "אין תורים בזמן המבוקש. אפשר לבחור זמן אחר.";
 
 export function formatOfferedOptionLabel(
   startAt: Date,

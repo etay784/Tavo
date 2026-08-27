@@ -860,6 +860,15 @@ describe("phase 2A whatsapp worker", () => {
     await runInboundOnce(pool, "w-staff", processor);
     await runOutboundOnce(pool, "w-staff", phoneKeys, messages, fakeWa);
     expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("לא מצאתי איש צוות");
+    const staffState = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ state: string }>(
+        `SELECT conv.state FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-staff-u'`,
+      );
+      return r.rows[0]!.state;
+    });
+    expect(staffState).toBe("AWAITING_STAFF");
     ai.nextIntent = {
       intent: "FIND_AVAILABILITY",
       confidence: 0.99,
@@ -901,6 +910,209 @@ describe("phase 2A whatsapp worker", () => {
     await runInboundOnce(pool, "w-staff", processor);
     await runOutboundOnce(pool, "w-staff", phoneKeys, messages, fakeWa);
     expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toMatch(/לא מצאתי שירות|יש כמה שירותים/);
+    ai.nextIntent = null;
+  });
+
+  it("resolves staff clarification without leaving AWAITING_SERVICE", async () => {
+    const from = "972500100020";
+    ai.nextIntent = {
+      intent: "FIND_AVAILABILITY",
+      confidence: 0.99,
+      service_name: "תספורת",
+      staff_name: "Nobody",
+      weekday: "THU",
+      time_window: "MORNING",
+    };
+    const raw1 = JSON.stringify(textPayload("wamid-astaff-1", "יש תספורת בחמישי בבוקר אצל Nobody?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-astaff", processor);
+    await runOutboundOnce(pool, "w-astaff", phoneKeys, messages, fakeWa);
+    expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("לא מצאתי איש צוות");
+    const mid = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{
+        state: string;
+        service_id: string | null;
+        pending_request: { weekday?: string; time_window?: string };
+      }>(
+        `SELECT conv.state, conv.service_id, conv.pending_request
+         FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-astaff-1'`,
+      );
+      return r.rows[0]!;
+    });
+    expect(mid.state).toBe("AWAITING_STAFF");
+    expect(mid.service_id).toBeTruthy();
+    expect(mid.pending_request.weekday).toBe("THU");
+    expect(mid.pending_request.time_window).toBe("MORNING");
+    const raw2 = JSON.stringify(textPayload("wamid-astaff-2", "Daniel", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-astaff", processor);
+    await runOutboundOnce(pool, "w-astaff", phoneKeys, messages, fakeWa);
+    const offer = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(offer).toContain("זמין:");
+    expect(offer).toContain("אצל Daniel");
+    const hours = [...offer.matchAll(/(\d)\) (\d{2}):(\d{2}) אצל/g)].map((m) => Number(m[2]));
+    expect(hours.length).toBeGreaterThan(0);
+    expect(hours.every((h) => h >= 9 && h < 12)).toBe(true);
+  });
+
+  it("keeps Thursday and Daniel after a zero-slot morning search", async () => {
+    const gil = await catalog.createStaff(ctx, "Gil");
+    const cut = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(`SELECT id FROM services WHERE name = 'תספורת' LIMIT 1`);
+      return r.rows[0]!.id;
+    });
+    await catalog.assignService(ctx, gil.id, cut);
+    await catalog.setWorkingHours(ctx, gil.id, 4, "17:00", "21:00");
+    const from = "972500100021";
+    const raw1 = JSON.stringify(textPayload("wamid-zero-1", "יש תספורת בחמישי בבוקר אצל Gil?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw1), JSON.parse(raw1), messages, routingKey);
+    await runInboundOnce(pool, "w-zero", processor);
+    await runOutboundOnce(pool, "w-zero", phoneKeys, messages, fakeWa);
+    expect(fakeWa.sent[fakeWa.sent.length - 1]?.body).toContain("אין תורים בזמן המבוקש");
+    const pending = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{
+        service_id: string | null;
+        pending_request: { weekday?: string; time_window?: string; staff_name?: string };
+      }>(
+        `SELECT conv.service_id, conv.pending_request
+         FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-zero-1'`,
+      );
+      return r.rows[0]!;
+    });
+    expect(pending.service_id).toBeTruthy();
+    expect(pending.pending_request.weekday).toBe("THU");
+    expect(pending.pending_request.staff_name).toBe("Gil");
+    const raw2 = JSON.stringify(textPayload("wamid-zero-2", "אז בערב?", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-zero", processor);
+    await runOutboundOnce(pool, "w-zero", phoneKeys, messages, fakeWa);
+    const offer = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(offer).toContain("זמין:");
+    expect(offer).toContain("אצל Gil");
+    const hours = [...offer.matchAll(/(\d)\) (\d{2}):(\d{2}) אצל/g)].map((m) => Number(m[2]));
+    expect(hours.length).toBeGreaterThan(0);
+    expect(hours.every((h) => h >= 17 && h < 21)).toBe(true);
+  });
+
+  it("searches time_to-only, time_from-only, and an exact 15-minute slot start", async () => {
+    const fromTo = "972500100022";
+    ai.nextIntent = {
+      intent: "FIND_AVAILABILITY",
+      confidence: 0.99,
+      service_name: "תספורת",
+      staff_name: "Daniel",
+      relative_when: "TOMORROW",
+      time_to: "12:00",
+    };
+    await persistParsedWebhook(
+      pool,
+      Buffer.from(JSON.stringify(textPayload("wamid-tto", "לפני 12:00", fromTo))),
+      JSON.parse(JSON.stringify(textPayload("wamid-tto", "לפני 12:00", fromTo))),
+      messages,
+      routingKey,
+    );
+    await runInboundOnce(pool, "w-tb", processor);
+    await runOutboundOnce(pool, "w-tb", phoneKeys, messages, fakeWa);
+    const before = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(before).toContain("זמין:");
+    const beforeHours = [...before.matchAll(/(\d)\) (\d{2}):(\d{2}) אצל/g)].map((m) => Number(m[2]));
+    expect(beforeHours.every((h) => h < 12)).toBe(true);
+
+    const fromFrom = "972500100023";
+    ai.nextIntent = {
+      intent: "FIND_AVAILABILITY",
+      confidence: 0.99,
+      service_name: "תספורת",
+      staff_name: "Daniel",
+      relative_when: "TOMORROW",
+      time_from: "10:00",
+    };
+    await persistParsedWebhook(
+      pool,
+      Buffer.from(JSON.stringify(textPayload("wamid-tfrom", "אחרי 10:00", fromFrom))),
+      JSON.parse(JSON.stringify(textPayload("wamid-tfrom", "אחרי 10:00", fromFrom))),
+      messages,
+      routingKey,
+    );
+    await runInboundOnce(pool, "w-tb", processor);
+    await runOutboundOnce(pool, "w-tb", phoneKeys, messages, fakeWa);
+    const after = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(after).toContain("זמין:");
+    expect(after).toMatch(/1[0-6]:/);
+
+    const fromExact = "972500100024";
+    const rina = await catalog.createStaff(ctx, "Rina");
+    const cutId = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ id: string }>(`SELECT id FROM services WHERE name = 'תספורת' LIMIT 1`);
+      return r.rows[0]!.id;
+    });
+    await catalog.assignService(ctx, rina.id, cutId);
+    for (const dow of [0, 1, 2, 3, 4]) {
+      await catalog.setWorkingHours(ctx, rina.id, dow, "09:00", "21:00");
+    }
+    ai.nextIntent = {
+      intent: "FIND_AVAILABILITY",
+      confidence: 0.99,
+      service_name: "תספורת",
+      staff_name: "Rina",
+      relative_when: "TOMORROW",
+      time_exact: "18:30",
+    };
+    await persistParsedWebhook(
+      pool,
+      Buffer.from(JSON.stringify(textPayload("wamid-texact", "בשעה 18:30", fromExact))),
+      JSON.parse(JSON.stringify(textPayload("wamid-texact", "בשעה 18:30", fromExact))),
+      messages,
+      routingKey,
+    );
+    await runInboundOnce(pool, "w-tb", processor);
+    await runOutboundOnce(pool, "w-tb", phoneKeys, messages, fakeWa);
+    const exact = fakeWa.sent[fakeWa.sent.length - 1]?.body ?? "";
+    expect(exact).toContain("18:30");
+    expect(exact).not.toContain("18:45");
+    expect(exact).not.toContain("18:00");
+    ai.nextIntent = null;
+  });
+
+  it("replaces a stored civil_date when the user says tomorrow instead", async () => {
+    const from = "972500100025";
+    ai.nextIntent = {
+      intent: "FIND_AVAILABILITY",
+      confidence: 0.99,
+      service_name: "תספורת",
+      staff_name: "Daniel",
+      civil_date: "2026-08-27",
+      time_window: "MORNING",
+    };
+    await persistParsedWebhook(
+      pool,
+      Buffer.from(JSON.stringify(textPayload("wamid-corr-1", "ב-2026-08-27 בבוקר", from))),
+      JSON.parse(JSON.stringify(textPayload("wamid-corr-1", "ב-2026-08-27 בבוקר", from))),
+      messages,
+      routingKey,
+    );
+    await runInboundOnce(pool, "w-corr", processor);
+    await runOutboundOnce(pool, "w-corr", phoneKeys, messages, fakeWa);
+    const raw2 = JSON.stringify(textPayload("wamid-corr-2", "בעצם מחר", from));
+    await persistParsedWebhook(pool, Buffer.from(raw2), JSON.parse(raw2), messages, routingKey);
+    await runInboundOnce(pool, "w-corr", processor);
+    await runOutboundOnce(pool, "w-corr", phoneKeys, messages, fakeWa);
+    const stored = await withTenant(pool, TENANT, async (c) => {
+      const r = await c.query<{ pending_request: { civil_date?: string; relative_when?: string; weekday?: string } }>(
+        `SELECT conv.pending_request
+         FROM conversations conv
+         JOIN whatsapp_inbound_events e ON e.conversation_id = conv.id
+         WHERE e.provider_message_id = 'wamid-corr-2'`,
+      );
+      return r.rows[0]!.pending_request;
+    });
+    expect(stored.civil_date).toBeUndefined();
+    expect(stored.weekday).toBeUndefined();
+    expect(stored.relative_when).toBe("TOMORROW");
     ai.nextIntent = null;
   });
 });

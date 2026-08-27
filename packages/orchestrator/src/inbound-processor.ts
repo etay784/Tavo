@@ -65,6 +65,7 @@ import {
   CLARIFY_SERVICE_HE,
   CLARIFY_STAFF_HE,
   FALLBACK_HE,
+  NO_AVAILABILITY_HE,
   SLOT_UNAVAILABLE_HE,
   formatAppointmentOptionLabel,
   formatAvailabilityList,
@@ -158,6 +159,12 @@ function resolveByName<T extends { name: string }>(
   if (partial.length === 1) return { ok: partial[0]! };
   if (partial.length > 1) return { fail: "ambiguous" };
   return { fail: "unknown" };
+}
+
+function omitStaffName(pending: PendingRequest | null | undefined): PendingRequest | null {
+  if (!pending) return null;
+  const { staff_name: _ignored, ...kept } = pending;
+  return Object.keys(kept).length ? kept : null;
 }
 
 function idlePlan(facts: string, intent: string): Plan {
@@ -644,6 +651,9 @@ export class InboundProcessor {
     if (parsed.intent === "SELECT_SERVICE" || prepared.state === "AWAITING_SERVICE") {
       return this.planServiceSelect(ctx, prepared, parsed, snap);
     }
+    if (parsed.intent === "SELECT_STAFF" || prepared.state === "AWAITING_STAFF") {
+      return this.planStaffSelect(ctx, prepared, parsed, snap);
+    }
     if (parsed.intent === "FIND_AVAILABILITY" || parsed.intent === "CLARIFY") {
       return this.planAvailability(ctx, prepared, parsed, snap);
     }
@@ -716,6 +726,33 @@ export class InboundProcessor {
     );
   }
 
+  private async planStaffSelect(
+    ctx: TrustedTenantContext,
+    prepared: Prepared,
+    parsed: StructuredIntent,
+    snap: Snapshot,
+  ): Promise<Plan> {
+    const pending = mergePendingRequest(prepared.pendingRequest, parsed);
+    const named = resolveByName(snap.staff, parsed.staff_name);
+    if ("fail" in named || "skip" in named) {
+      return {
+        facts: "fail" in named && named.fail === "ambiguous" ? AMBIGUOUS_STAFF_HE : CLARIFY_STAFF_HE,
+        state: "AWAITING_STAFF",
+        serviceId: prepared.serviceId,
+        pendingAppointmentId: prepared.pendingAppointmentId,
+        offerSetId: null,
+        pendingRequest: omitStaffName(pending),
+        intent: "SELECT_STAFF",
+      };
+    }
+    return this.planAvailability(
+      ctx,
+      { ...prepared, pendingRequest: pending },
+      { ...parsed, intent: "FIND_AVAILABILITY", confidence: 1, staff_name: named.ok.name },
+      snap,
+    );
+  }
+
   private async planAvailability(
     ctx: TrustedTenantContext,
     prepared: {
@@ -758,19 +795,23 @@ export class InboundProcessor {
     const staffHintName = parsed.staff_name ?? pending?.staff_name;
     const staffResolved = resolveByName(snap.staff, staffHintName);
     if ("fail" in staffResolved) {
+      const { staff_name: _ignored, ...kept } = pending ?? {};
       return {
         facts: staffResolved.fail === "ambiguous" ? AMBIGUOUS_STAFF_HE : CLARIFY_STAFF_HE,
-        state: prepared.serviceId ? "AWAITING_SERVICE" : "IDLE",
-        serviceId: null,
-        pendingAppointmentId: null,
+        state: "AWAITING_STAFF",
+        serviceId: service.id,
+        pendingAppointmentId: prepared.pendingAppointmentId ?? null,
         offerSetId: null,
-        pendingRequest: pending,
+        pendingRequest: Object.keys(kept).length ? kept : null,
         intent: "FIND_AVAILABILITY",
       };
     }
     const staffHint = "ok" in staffResolved ? staffResolved.ok : undefined;
-    const relative = pending?.relative_when ?? parsed.relative_when ?? "TOMORROW";
-    const window = pending?.time_window ?? parsed.time_window ?? "EVENING";
+    const relative =
+      pending?.relative_when ??
+      parsed.relative_when ??
+      (pending?.civil_date || pending?.weekday ? undefined : "TOMORROW");
+    const window = pending?.time_window ?? parsed.time_window;
     const bounds = civilWindow(this.clock.now(), snap.business.timezone, relative, window, {
       ...(pending?.civil_date ? { civilDate: pending.civil_date } : {}),
       ...(pending?.weekday ? { weekday: pending.weekday } : {}),
@@ -789,7 +830,15 @@ export class InboundProcessor {
     );
     const capped = matching.slice(0, 5);
     if (capped.length === 0) {
-      return idlePlan(FALLBACK_HE, "FIND_AVAILABILITY");
+      return {
+        facts: NO_AVAILABILITY_HE,
+        state: "IDLE",
+        serviceId: service.id,
+        pendingAppointmentId: prepared.pendingAppointmentId ?? null,
+        offerSetId: null,
+        pendingRequest: staffHint ? { ...(pending ?? {}), staff_name: staffHint.name } : pending,
+        intent: "FIND_AVAILABILITY",
+      };
     }
     const offerSetId = randomUUID();
     const expiresAt = new Date(Math.max(Date.now(), this.clock.now().getTime()) + 2 * 60 * 60 * 1000);
@@ -811,7 +860,7 @@ export class InboundProcessor {
       serviceId: service.id,
       pendingAppointmentId: prepared.pendingAppointmentId ?? null,
       offerSetId,
-      pendingRequest: pending,
+      pendingRequest: staffHint ? { ...(pending ?? {}), staff_name: staffHint.name } : pending,
       offered,
       intent: "FIND_AVAILABILITY",
     };
@@ -1060,8 +1109,8 @@ export function slotInLocalMinutes(
 export function civilWindow(
   now: Date,
   timeZone: string,
-  relative: "TODAY" | "TOMORROW" | "THIS_WEEK",
-  window: "MORNING" | "AFTERNOON" | "EVENING",
+  relative: "TODAY" | "TOMORROW" | "THIS_WEEK" | undefined,
+  window: "MORNING" | "AFTERNOON" | "EVENING" | undefined,
   extra?: {
     civilDate?: string;
     weekday?: "SUN" | "MON" | "TUE" | "WED" | "THU" | "FRI" | "SAT";
@@ -1071,14 +1120,25 @@ export function civilWindow(
   },
 ): { from: Date; to: Date; minuteFrom: number; minuteTo: number } {
   const localNow = DateTime.fromJSDate(now, { zone: "utc" }).setZone(timeZone);
-  let minuteFrom = WINDOW_MINUTES[window][0];
-  let minuteTo = WINDOW_MINUTES[window][1];
+  let minuteFrom = 0;
+  let minuteTo = 24 * 60;
+  if (window) {
+    minuteFrom = WINDOW_MINUTES[window][0];
+    minuteTo = WINDOW_MINUTES[window][1];
+  }
   if (extra?.timeExact) {
     minuteFrom = parseHm(extra.timeExact);
-    minuteTo = minuteFrom + 30;
+    minuteTo = minuteFrom + 1;
+    if (window) {
+      const [ws, we] = WINDOW_MINUTES[window];
+      if (minuteFrom < ws || minuteFrom >= we) {
+        const empty = localNow.toUTC().toJSDate();
+        return { from: empty, to: empty, minuteFrom, minuteTo };
+      }
+    }
   } else {
-    if (extra?.timeFrom) minuteFrom = Math.max(minuteFrom, parseHm(extra.timeFrom));
-    if (extra?.timeTo) minuteTo = Math.min(minuteTo, parseHm(extra.timeTo));
+    if (extra?.timeFrom) minuteFrom = window ? Math.max(minuteFrom, parseHm(extra.timeFrom)) : parseHm(extra.timeFrom);
+    if (extra?.timeTo) minuteTo = window ? Math.min(minuteTo, parseHm(extra.timeTo)) : parseHm(extra.timeTo);
   }
   if (minuteTo <= minuteFrom) {
     const empty = localNow.toUTC().toJSDate();
@@ -1088,10 +1148,13 @@ export function civilWindow(
   const atMinutes = (day: DateTime, minutes: number) =>
     day.startOf("day").plus({ minutes });
 
+  const searchFromMin = extra?.timeExact ? (window ? WINDOW_MINUTES[window][0] : 0) : minuteFrom;
+  const searchToMin = extra?.timeExact ? (window ? WINDOW_MINUTES[window][1] : 24 * 60) : minuteTo;
+
   if (extra?.civilDate) {
     const day = DateTime.fromISO(extra.civilDate, { zone: timeZone }).startOf("day");
-    let from = atMinutes(day, minuteFrom);
-    const to = atMinutes(day, minuteTo);
+    let from = atMinutes(day, searchFromMin);
+    const to = atMinutes(day, searchToMin);
     if (from < localNow) from = localNow;
     return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate(), minuteFrom, minuteTo };
   }
@@ -1108,8 +1171,8 @@ export function civilWindow(
       const empty = localNow.toUTC().toJSDate();
       return { from: empty, to: empty, minuteFrom, minuteTo };
     }
-    let from = atMinutes(day, minuteFrom);
-    const to = atMinutes(day, minuteTo);
+    let from = atMinutes(day, searchFromMin);
+    const to = atMinutes(day, searchToMin);
     if (from < localNow) from = localNow;
     return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate(), minuteFrom, minuteTo };
   }
@@ -1124,11 +1187,11 @@ export function civilWindow(
   }
 
   let day = localNow.startOf("day");
-  if (relative === "TOMORROW") {
+  if (relative !== "TODAY") {
     day = day.plus({ days: 1 });
   }
-  let from = atMinutes(day, minuteFrom);
-  const to = atMinutes(day, minuteTo);
+  let from = atMinutes(day, searchFromMin);
+  const to = atMinutes(day, searchToMin);
   if (from < localNow) from = localNow;
   return { from: from.toUTC().toJSDate(), to: to.toUTC().toJSDate(), minuteFrom, minuteTo };
 }

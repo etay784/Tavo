@@ -81,6 +81,31 @@ describe("civilWindow", () => {
     expect(w.minuteTo).toBe(11 * 60);
   });
 
+  it("does not imply EVENING for a time_from-only request", () => {
+    const w = civilWindow(new Date("2026-08-25T08:00:00.000Z"), "Asia/Jerusalem", "TOMORROW", undefined, {
+      timeFrom: "10:00",
+    });
+    expect(w.minuteFrom).toBe(10 * 60);
+    expect(w.minuteTo).toBe(24 * 60);
+  });
+
+  it("does not imply a morning band for a time_to-only request", () => {
+    const w = civilWindow(new Date("2026-08-25T08:00:00.000Z"), "Asia/Jerusalem", "TOMORROW", undefined, {
+      timeTo: "12:00",
+    });
+    expect(w.minuteFrom).toBe(0);
+    expect(w.minuteTo).toBe(12 * 60);
+  });
+
+  it("treats time_exact as the slot start, not a 30-minute window", () => {
+    const w = civilWindow(new Date("2026-08-25T08:00:00.000Z"), "Asia/Jerusalem", "TOMORROW", undefined, {
+      timeExact: "18:30",
+    });
+    expect(w.minuteFrom).toBe(18 * 60 + 30);
+    expect(w.minuteTo).toBe(18 * 60 + 31);
+    expect(w.to.getTime() - w.from.getTime()).toBeGreaterThan(60_000);
+  });
+
   it("does not treat THIS_WEEK evening as morning", () => {
     const week = civilWindow(new Date("2026-08-25T08:00:00.000Z"), "Asia/Jerusalem", "THIS_WEEK", "EVENING");
     const morning = new Date("2026-08-26T06:00:00.000Z");

@@ -3,12 +3,29 @@ import { z } from "zod";
 export const ConversationStateSchema = z.enum([
   "IDLE",
   "AWAITING_SERVICE",
+  "AWAITING_STAFF",
   "OFFERING_SLOTS",
   "AWAITING_BOOK_CONFIRM",
   "AWAITING_CANCEL_CONFIRM",
   "AWAITING_RESCHEDULE_APPOINTMENT",
   "AWAITING_RESCHEDULE_SLOT",
 ]);
+
+/** Real 00:00–23:59 civil clock time, not merely \d{2}:\d{2}. */
+export const CivilTimeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
+
+export function isCivilDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parts = value.split("-").map(Number);
+  const y = parts[0];
+  const m = parts[1];
+  const d = parts[2];
+  if (y === undefined || m === undefined || d === undefined) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+export const CivilDateSchema = z.string().refine(isCivilDate, { message: "invalid civil_date" });
 
 export const MinContextSchema = z
   .object({
@@ -36,6 +53,7 @@ export const IntentSchema = z
       "FIND_AVAILABILITY",
       "SELECT_SLOT",
       "SELECT_SERVICE",
+      "SELECT_STAFF",
       "CREATE_BOOKING",
       "GET_BOOKING",
       "GET_PRICE",
@@ -52,11 +70,11 @@ export const IntentSchema = z
     relative_when: z.enum(["TODAY", "TOMORROW", "THIS_WEEK"]).optional(),
     service_name: z.string().min(1).max(80).optional(),
     staff_name: z.string().min(1).max(80).optional(),
-    civil_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    civil_date: CivilDateSchema.optional(),
     weekday: z.enum(["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]).optional(),
-    time_exact: z.string().regex(/^\d{2}:\d{2}$/).optional(),
-    time_from: z.string().regex(/^\d{2}:\d{2}$/).optional(),
-    time_to: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    time_exact: CivilTimeSchema.optional(),
+    time_from: CivilTimeSchema.optional(),
+    time_to: CivilTimeSchema.optional(),
   })
   .strict();
 
@@ -64,13 +82,13 @@ export type StructuredIntent = z.infer<typeof IntentSchema>;
 
 export const PendingRequestSchema = z
   .object({
-    civil_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    civil_date: CivilDateSchema.optional(),
     weekday: z.enum(["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]).optional(),
     relative_when: z.enum(["TODAY", "TOMORROW", "THIS_WEEK"]).optional(),
     time_window: z.enum(["MORNING", "AFTERNOON", "EVENING"]).optional(),
-    time_exact: z.string().regex(/^\d{2}:\d{2}$/).optional(),
-    time_from: z.string().regex(/^\d{2}:\d{2}$/).optional(),
-    time_to: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    time_exact: CivilTimeSchema.optional(),
+    time_from: CivilTimeSchema.optional(),
+    time_to: CivilTimeSchema.optional(),
     staff_name: z.string().min(1).max(80).optional(),
   })
   .strict();
@@ -90,13 +108,89 @@ export function extractPendingRequest(parsed: StructuredIntent): PendingRequest 
   return next;
 }
 
+const WINDOW_MINUTES = {
+  MORNING: [9 * 60, 12 * 60] as const,
+  AFTERNOON: [12 * 60, 17 * 60] as const,
+  EVENING: [17 * 60, 21 * 60] as const,
+};
+
+function parseHm(value: string): number {
+  const [h, m] = value.split(":").map(Number);
+  return (h ?? 0) * 60 + (m ?? 0);
+}
+
+function windowOverlaps(
+  window: "MORNING" | "AFTERNOON" | "EVENING",
+  timeFrom?: string,
+  timeTo?: string,
+): boolean {
+  const [start, end] = WINDOW_MINUTES[window];
+  const from = timeFrom ? parseHm(timeFrom) : start;
+  const to = timeTo ? parseHm(timeTo) : end;
+  return from < to && from < end && to > start;
+}
+
+/**
+ * Canonical merge: a new date/time field replaces conflicting stored fields
+ * instead of OR-ing them into an impossible constraint.
+ */
 export function mergePendingRequest(
   stored: PendingRequest | null | undefined,
   parsed: StructuredIntent,
 ): PendingRequest | null {
   const extracted = extractPendingRequest(parsed);
-  const merged = { ...(stored ?? {}), ...extracted };
-  return Object.keys(merged).length ? merged : null;
+  if (Object.keys(extracted).length === 0) {
+    return stored && Object.keys(stored).length ? { ...stored } : null;
+  }
+  const base: PendingRequest = { ...(stored ?? {}) };
+
+  if (extracted.civil_date) {
+    delete base.weekday;
+    delete base.relative_when;
+    base.civil_date = extracted.civil_date;
+  } else if (extracted.weekday) {
+    delete base.civil_date;
+    delete base.relative_when;
+    base.weekday = extracted.weekday;
+  } else if (extracted.relative_when) {
+    delete base.civil_date;
+    delete base.weekday;
+    base.relative_when = extracted.relative_when;
+  }
+
+  const hasExact = extracted.time_exact !== undefined;
+  const hasWindow = extracted.time_window !== undefined;
+  const hasFrom = extracted.time_from !== undefined;
+  const hasTo = extracted.time_to !== undefined;
+
+  if (hasExact) {
+    base.time_exact = extracted.time_exact;
+    if (!hasWindow) delete base.time_window;
+    if (!hasFrom) delete base.time_from;
+    if (!hasTo) delete base.time_to;
+  }
+  if (hasWindow) {
+    base.time_window = extracted.time_window;
+    if (!hasExact) delete base.time_exact;
+    if (!hasFrom) delete base.time_from;
+    if (!hasTo) delete base.time_to;
+  }
+  if (hasFrom) base.time_from = extracted.time_from;
+  if (hasTo) base.time_to = extracted.time_to;
+  if ((hasFrom || hasTo) && !hasExact) delete base.time_exact;
+
+  if (base.time_from && base.time_to && parseHm(base.time_from) >= parseHm(base.time_to)) {
+    if (hasFrom && !hasTo) delete base.time_to;
+    else if (hasTo && !hasFrom) delete base.time_from;
+  }
+  if (base.time_window && (hasFrom || hasTo) && !hasWindow) {
+    if (!windowOverlaps(base.time_window, base.time_from, base.time_to)) {
+      delete base.time_window;
+    }
+  }
+
+  if (extracted.staff_name) base.staff_name = extracted.staff_name;
+  return Object.keys(base).length ? base : null;
 }
 
 export type IntentExtractionInput = {
@@ -126,6 +220,11 @@ async function wait(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function padHm(value: string): string {
+  const [h, m] = value.split(":");
+  return `${(h ?? "0").padStart(2, "0")}:${m ?? "00"}`;
+}
+
 function availabilityHints(t: string, context: MinContext): Partial<StructuredIntent> {
   const hints: Partial<StructuredIntent> = {};
   if (t.includes("בוקר")) hints.time_window = "MORNING";
@@ -142,10 +241,15 @@ function availabilityHints(t: string, context: MinContext): Partial<StructuredIn
     (s) => t.includes(s.name.toLowerCase()) || (s.name.toLowerCase() === "daniel" && t.includes("דניאל")),
   );
   if (staff) hints.staff_name = staff.name;
+  const exact =
+    t.match(/בשעה\s+(\d{1,2}:\d{2})/) ??
+    t.match(/exactly\s+(\d{1,2}:\d{2})/) ??
+    t.match(/at\s+(\d{1,2}:\d{2})/);
+  if (exact) hints.time_exact = padHm(exact[1]!);
   const after = t.match(/אחרי\s+(\d{1,2}:\d{2})/) ?? t.match(/after\s+(\d{1,2}:\d{2})/);
   const before = t.match(/לפני\s+(\d{1,2}:\d{2})/) ?? t.match(/before\s+(\d{1,2}:\d{2})/);
-  if (after) hints.time_from = after[1]!.padStart(5, "0");
-  if (before) hints.time_to = before[1]!.padStart(5, "0");
+  if (after) hints.time_from = padHm(after[1]!);
+  if (before) hints.time_to = padHm(before[1]!);
   return hints;
 }
 
@@ -204,6 +308,19 @@ export class FakeAIProvider implements AIProvider {
       return { intent: "GET_BOOKING", confidence: 0.9 };
     }
     const ordinal = ordinalFromText(t);
+    if (state === "AWAITING_STAFF") {
+      const named = input.context.staff.find(
+        (s) => t.includes(s.name.toLowerCase()) || (s.name.toLowerCase() === "daniel" && t.includes("דניאל")),
+      );
+      if (named) {
+        return { intent: "SELECT_STAFF", confidence: 0.9, staff_name: named.name };
+      }
+      const hints = availabilityHints(t, input.context);
+      if (hints.time_window || hints.relative_when || hints.weekday || hints.civil_date || hints.time_from || hints.time_to) {
+        return { intent: "FIND_AVAILABILITY", confidence: 0.9, ...hints };
+      }
+      return { intent: "CLARIFY", confidence: 0.7 };
+    }
     if (state === "AWAITING_SERVICE" && (ordinal || input.context.services.some((s) => t.includes(s.name.toLowerCase())))) {
       const named = input.context.services.find((s) => t.includes(s.name.toLowerCase()));
       return {
@@ -235,7 +352,19 @@ export class FakeAIProvider implements AIProvider {
         ...availabilityHints(t, input.context),
       };
     }
-    if (t.includes("תספורת") || t.includes("מחר") || t.includes("ערב") || t.includes("בוקר") || t.includes("משהו")) {
+    if (
+      t.includes("תספורת") ||
+      t.includes("מחר") ||
+      t.includes("ערב") ||
+      t.includes("בוקר") ||
+      t.includes("משהו") ||
+      t.includes("לפני") ||
+      t.includes("אחרי") ||
+      t.includes("בעצם") ||
+      t.includes("בשעה") ||
+      t.includes("before") ||
+      t.includes("after")
+    ) {
       return {
         intent: "FIND_AVAILABILITY",
         confidence: 0.9,
