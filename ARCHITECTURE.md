@@ -191,10 +191,17 @@ Until that harness exists, tests call domain services and repositories directly.
 
 ## 13. Phase 2A (WhatsApp + FakeAI)
 
-See `ADR/0007`–`ADR/0012`. Runtime uses `tavo_routing` SECURITY DEFINER helpers (`search_path = pg_catalog`, schema-qualified names) to resolve integrations and claim jobs, then `tavo_app` + transaction-local RLS. No real LLM provider (`ADR/0012` deferred). `tavo_app` has no `BYPASSRLS` and no `CREATE` on `public` or `tavo_routing`.
+See `ADR/0007`–`ADR/0012`. Runtime uses `tavo_routing` SECURITY DEFINER helpers (`search_path = pg_catalog`, schema-qualified names) to resolve integrations and claim jobs, then `tavo_app` + transaction-local RLS. Real LLM calls are optional behind `TAVO_AI_PROVIDER` (`ADR/0012` accepted: OpenAI Responses API, `store=false`, structured output only). Default CI/runtime stays `FakeAIProvider`. `tavo_app` has no `BYPASSRLS` and no `CREATE` on `public` or `tavo_routing`.
 
 WhatsApp GET_BOOKING / CANCEL_BOOKING / RESCHEDULE_BOOKING operate only on the authenticated customer's **future** `CONFIRMED` appointments (`start_at` strictly after the trusted worker clock). Past confirmed rows remain in the database but are not listed or mutated through WhatsApp.
 
 Availability and reschedule use an Israeli civil week of **Sunday 00:00 through Saturday end-of-day** in the business timezone. `THIS_WEEK` is the remaining portion of that week and still applies the requested time-of-day band when one was actually asked. A `time_from` / `time_to` bound without a band searches that civil day (or remaining week) without implying evening. `time_exact` is the requested slot start on the business grid, not a 30-minute window. Multi-turn clarification stores an allowlisted `conversations.pending_request` JSON object. Canonical merge replaces conflicting date/time fields (a new `relative_when` drops `civil_date`/`weekday`; a new `time_window` drops stale exact/from/to bounds unless they were supplied in the same turn). Unknown/ambiguous staff uses `AWAITING_STAFF` (not `AWAITING_SERVICE`). Zero-slot replies keep that structured request plus selected service/staff. An offered slot that is gone between offer and book is a customer-visible business outcome (`SLOT_NO_LONGER_AVAILABLE`): the inbound turn is `PROCESSED` with deterministic replacement text, not retried as infrastructure failure.
 
 Phase 2A customer replies are deterministic formatters (no free-form wrapper authority). Slot ordinals are unique per `offer_set_id`. Webhook HTTP 200 is returned only after durable persist of supported text events (or intentional ignore of signed status/unsupported). Inbound/outbound workers use bounded retries, `DEAD`/`FAILED` terminals, unique conversation lease tokens, and do not hold a PostgreSQL transaction open across AI or Graph I/O. Final conversation mutations require `lease_token`, `lock_version`, and `lease_expires_at > now()`. Per-sender LLM budget admission is checked before incrementing the tenant hourly window.
+
+## 14. Phase 2B (Silent Router + optional real NLU)
+
+Pipeline: signed webhook → tenant bind → customer/conversation lookup → **Silent Router** → silence or receptionist → structured intent → Phase 2A engine → formatters → Cloud API.
+
+A `customers` row is not `BUSINESS_VERIFIED`. Router states: `UNKNOWN` (default silence), `BUSINESS_VERIFIED`, `PERSONAL_EXCLUDED`, `HUMAN_ONLY`. Owner override wins. Lexical Tier-B combinations and classifier `BUSINESS` authorize the current turn only; persist `BUSINESS_VERIFIED` after Tier-A events (booking success, appointment lifecycle, owner mark). Matching is whole-token/phrase, not substring. Classifier never writes PERSONAL. No payments, dashboard, or mixed personal/business production number in this phase.
+

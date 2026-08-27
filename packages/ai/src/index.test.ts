@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { FakeAIProvider, IntentSchema, mergePendingRequest, type MinContext, type StructuredIntent } from "./index";
+import {
+  FakeAIProvider,
+  IntentSchema,
+  MinContextSchema,
+  mergePendingRequest,
+  type MinContext,
+  type StructuredIntent,
+} from "./index";
 
 const ctx: MinContext = {
   conversation_state: "IDLE",
@@ -106,6 +113,28 @@ describe("mergePendingRequest", () => {
     expect(merged?.time_window).toBe("MORNING");
     expect(merged?.time_from).toBeUndefined();
     expect(merged?.weekday).toBe("THU");
+  });
+});
+
+describe("customer-scope schemas", () => {
+  it("rejects customer and tenant identity fields on intents and MinContext", () => {
+    expect(() =>
+      IntentSchema.parse({ intent: "GET_BOOKING", confidence: 1, customer_id: "x" }),
+    ).toThrow();
+    expect(() =>
+      IntentSchema.parse({ intent: "CANCEL_BOOKING", confidence: 1, customer_phone: "0501234567" }),
+    ).toThrow();
+    expect(() =>
+      IntentSchema.parse({
+        intent: "RESCHEDULE_BOOKING",
+        confidence: 1,
+        target_customer_id: "x",
+        target_phone: "050",
+      }),
+    ).toThrow();
+    expect(() => IntentSchema.parse({ intent: "UNKNOWN", confidence: 1, tenant_id: "x" })).toThrow();
+    expect(() => MinContextSchema.parse({ ...ctx, customer_id: "x" })).toThrow();
+    expect(() => MinContextSchema.parse({ ...ctx, tenant_id: "x" })).toThrow();
   });
 });
 

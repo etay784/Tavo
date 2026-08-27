@@ -257,5 +257,58 @@ describe("SECURITY DEFINER routing", () => {
          has_table_privilege('tavo_app', 'public.whatsapp_integrations', 'DELETE') AS del`,
     );
     expect(integrations.rows[0]).toEqual({ sel: true, ins: false, upd: false, del: false });
+    const exceptions = await superClient.query<{
+      sel: boolean;
+      ins: boolean;
+      upd: boolean;
+      del: boolean;
+    }>(
+      `SELECT
+         has_table_privilege('tavo_app', 'public.staff_schedule_exceptions', 'SELECT') AS sel,
+         has_table_privilege('tavo_app', 'public.staff_schedule_exceptions', 'INSERT') AS ins,
+         has_table_privilege('tavo_app', 'public.staff_schedule_exceptions', 'UPDATE') AS upd,
+         has_table_privilege('tavo_app', 'public.staff_schedule_exceptions', 'DELETE') AS del`,
+    );
+    expect(exceptions.rows[0]).toEqual({ sel: true, ins: true, upd: true, del: true });
+    const routing = await superClient.query<{
+      sel: boolean;
+      ins: boolean;
+      upd: boolean;
+      del: boolean;
+    }>(
+      `SELECT
+         has_table_privilege('tavo_app', 'public.conversation_routing', 'SELECT') AS sel,
+         has_table_privilege('tavo_app', 'public.conversation_routing', 'INSERT') AS ins,
+         has_table_privilege('tavo_app', 'public.conversation_routing', 'UPDATE') AS upd,
+         has_table_privilege('tavo_app', 'public.conversation_routing', 'DELETE') AS del`,
+    );
+    expect(routing.rows[0]).toEqual({ sel: true, ins: true, upd: true, del: false });
+  });
+
+  it("isolates conversation_routing by tenant", async () => {
+    const conv = await withTenant(appPool, TENANT_A, async (c) => {
+      const cust = await c.query<{ id: string }>(
+        `INSERT INTO customers (tenant_id, phone_encrypted, phone_encryption_key_version, phone_lookup_hash, phone_lookup_key_version)
+         VALUES ($1,'enc',1,'h-route',1) RETURNING id`,
+        [TENANT_A],
+      );
+      const { upsertConversation, getOrCreateConversationRouting } = await import("./phase2");
+      const conversation = await upsertConversation(c, TENANT_A, cust.rows[0]!.id);
+      await getOrCreateConversationRouting(c, TENANT_A, conversation.id, cust.rows[0]!.id);
+      return conversation.id;
+    });
+    const hidden = await withTenant(appPool, TENANT_B, async (c) => {
+      const r = await c.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM conversation_routing WHERE conversation_id = $1`,
+        [conv],
+      );
+      return r.rows[0]!.n;
+    });
+    expect(hidden).toBe(0);
+    const visible = await withTenant(appPool, TENANT_A, async (c) => {
+      const r = await c.query<{ n: number }>(`SELECT count(*)::int AS n FROM conversation_routing`);
+      return r.rows[0]!.n;
+    });
+    expect(visible).toBeGreaterThan(0);
   });
 });

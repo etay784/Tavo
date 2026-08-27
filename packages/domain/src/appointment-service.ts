@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import type { PhoneCryptoConfig } from "@tavo/security";
 import { lookupCandidates, normalizePhone, sealPhone } from "@tavo/security";
 import type { TrustedTenantContext } from "@tavo/shared";
-import { Errors } from "@tavo/shared";
+import { Errors, isExclusionViolation } from "@tavo/shared";
 import {
   cancelAppointment,
   consumeOfferedSlot,
@@ -20,6 +20,8 @@ import {
   withTenant,
 } from "@tavo/database";
 import { SchedulingService } from "./scheduling-service";
+
+const OWNER_BOOKING_SOURCES = new Set(["HARNESS", "INTERNAL", "SEED", "MANUAL", "PHONE", "WALK_IN"]);
 
 export class AppointmentService {
   constructor(
@@ -39,7 +41,16 @@ export class AppointmentService {
       source?: string;
     },
   ) {
-    const normalized = normalizePhone(input.customerPhone);
+    const source = input.source ?? "INTERNAL";
+    if (!OWNER_BOOKING_SOURCES.has(source)) {
+      throw Errors.validation("appointment source");
+    }
+    let normalized: string;
+    try {
+      normalized = normalizePhone(input.customerPhone);
+    } catch {
+      throw Errors.validation("phone");
+    }
     return withTenant(this.pool, ctx.tenantId, async (client) => {
       const { occupancy, service } = await this.scheduling.assertSlotAvailableOnClient(
         client,
@@ -60,26 +71,68 @@ export class AppointmentService {
           phoneLookupKeyVersion: sealed.phoneLookupKeyVersion,
         });
       }
-      const row = await insertAppointment(client, ctx.tenantId, {
-        customerId: customer.id,
-        staffId: input.staffId,
-        serviceId: input.serviceId,
-        locationId: staff.location_id,
-        startAt: occupancy.startAt,
-        endAt: occupancy.endAt,
-        occupiedStartAt: occupancy.occupiedStartAt,
-        occupiedEndAt: occupancy.occupiedEndAt,
-        source: input.source ?? "INTERNAL",
-      });
-      await insertAudit(client, ctx.tenantId, {
-        actorType: ctx.actorType,
-        actorId: ctx.actorId,
-        action: "appointment.created",
-        objectType: "appointment",
-        objectId: row.id,
-        metadata: { serviceId: service.id },
-      });
-      return row;
+      try {
+        const row = await insertAppointment(client, ctx.tenantId, {
+          customerId: customer.id,
+          staffId: input.staffId,
+          serviceId: input.serviceId,
+          locationId: staff.location_id,
+          startAt: occupancy.startAt,
+          endAt: occupancy.endAt,
+          occupiedStartAt: occupancy.occupiedStartAt,
+          occupiedEndAt: occupancy.occupiedEndAt,
+          source,
+        });
+        await insertAudit(client, ctx.tenantId, {
+          actorType: ctx.actorType,
+          actorId: ctx.actorId,
+          action: "appointment.created",
+          objectType: "appointment",
+          objectId: row.id,
+          metadata: { serviceId: service.id, source, staffId: input.staffId },
+        });
+        return row;
+      } catch (e) {
+        if (isExclusionViolation(e)) throw Errors.slotNoLongerAvailable();
+        throw e;
+      }
+    });
+  }
+
+  async blockTime(
+    ctx: TrustedTenantContext,
+    input: { staffId: string; startAt: Date; endAt: Date; internalNote?: string },
+  ) {
+    if (!(input.startAt < input.endAt)) throw Errors.validation("blocked range");
+    return withTenant(this.pool, ctx.tenantId, async (client) => {
+      const staff = await getStaff(client, ctx.tenantId, input.staffId);
+      if (!staff || !staff.active) throw Errors.notFound("staff");
+      try {
+        const row = await insertAppointment(client, ctx.tenantId, {
+          customerId: null,
+          staffId: input.staffId,
+          serviceId: null,
+          locationId: null,
+          startAt: input.startAt,
+          endAt: input.endAt,
+          occupiedStartAt: input.startAt,
+          occupiedEndAt: input.endAt,
+          source: "BLOCKED",
+          internalNote: input.internalNote ?? null,
+        });
+        await insertAudit(client, ctx.tenantId, {
+          actorType: ctx.actorType,
+          actorId: ctx.actorId,
+          action: "occupancy.blocked",
+          objectType: "appointment",
+          objectId: row.id,
+          metadata: { staffId: input.staffId },
+        });
+        return row;
+      } catch (e) {
+        if (isExclusionViolation(e)) throw Errors.slotNoLongerAvailable();
+        throw e;
+      }
     });
   }
 
@@ -104,7 +157,7 @@ export class AppointmentService {
       }
     }
     const existing = await getAppointment(client, ctx.tenantId, appointmentId);
-    if (!existing || existing.status !== "CONFIRMED") {
+    if (!existing || existing.status !== "CONFIRMED" || !existing.service_id) {
       throw Errors.notFound("appointment");
     }
     if (opts && existing.customer_id !== opts.customerId) {
@@ -268,7 +321,12 @@ export class AppointmentService {
       if (row) return row;
     }
     const existing = await getAppointment(client, ctx.tenantId, input.appointmentId);
-    if (!existing || existing.status !== "CONFIRMED" || existing.customer_id !== input.customerId) {
+    if (
+      !existing ||
+      existing.status !== "CONFIRMED" ||
+      !existing.service_id ||
+      existing.customer_id !== input.customerId
+    ) {
       throw Errors.notFound("appointment");
     }
     const slot = await lockOfferedSlot(client, ctx.tenantId, input.conversationId, input.slotRef);

@@ -14,6 +14,7 @@
     "audit:prod": "npm audit --omit=dev --audit-level=high",
     "sbom": "cyclonedx-npm --ignore-npm-errors -o sbom.cdx.json",
     "test": "npm run test -w @tavo/shared && npm run test -w @tavo/security && npm run test -w @tavo/database && npm run test -w @tavo/domain && npm run test -w @tavo/whatsapp && npm run test -w @tavo/ai && npm run test -w @tavo/orchestrator && npm run test -w @tavo/api",
+    "eval:real": "npm run eval:real -w @tavo/ai",
     "build": "npm run build --workspaces --if-present"
   },
   "engines": {

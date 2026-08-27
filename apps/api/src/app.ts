@@ -195,6 +195,69 @@ export function buildApp(
     return { ok: true };
   });
 
+  app.put("/v1/staff/:staffId/working-hours", async (req) => {
+    const params = z.object({ staffId: uuid }).parse(req.params);
+    const body = z
+      .object({
+        days: z
+          .array(
+            z.object({
+              dayOfWeek: z.number().int().min(0).max(6),
+              ranges: z.array(z.object({ startTime: z.string(), endTime: z.string() })),
+            }),
+          )
+          .min(1)
+          .max(7),
+      })
+      .parse(req.body);
+    const ctx = mustTenant(req);
+    for (const day of body.days) {
+      await catalog.setWorkingDayHours(ctx, params.staffId, day.dayOfWeek, day.ranges);
+    }
+    return { ok: true };
+  });
+
+  app.post("/v1/staff/:staffId/schedule-exceptions", async (req) => {
+    const params = z.object({ staffId: uuid }).parse(req.params);
+    const body = z
+      .object({
+        civilDate: z.string(),
+        kind: z.enum(["CLOSED", "OPEN"]),
+        ranges: z.array(z.object({ startTime: z.string(), endTime: z.string() })).optional(),
+      })
+      .parse(req.body);
+    const ctx = mustTenant(req);
+    if (body.kind === "CLOSED") {
+      await catalog.setDateException(ctx, params.staffId, body.civilDate, { kind: "CLOSED" });
+    } else {
+      await catalog.setDateException(ctx, params.staffId, body.civilDate, {
+        kind: "OPEN",
+        ranges: body.ranges ?? [],
+      });
+    }
+    return { ok: true };
+  });
+
+  app.post("/v1/staff/:staffId/blocked-time", async (req) => {
+    const params = z.object({ staffId: uuid }).parse(req.params);
+    const body = z
+      .object({
+        startAt: z.string().datetime(),
+        endAt: z.string().datetime(),
+        note: z.string().max(200).optional(),
+        customer_id: z.unknown().optional(),
+        customer_phone: z.unknown().optional(),
+      })
+      .parse(req.body);
+    const ctx = mustTenant(req);
+    return appointments.blockTime(ctx, {
+      staffId: params.staffId,
+      startAt: new Date(body.startAt),
+      endAt: new Date(body.endAt),
+      ...(body.note !== undefined ? { internalNote: body.note } : {}),
+    });
+  });
+
   app.post("/v1/staff/:staffId/breaks", async (req) => {
     const params = z.object({ staffId: uuid }).parse(req.params);
     const body = z.object({ startsAt: z.string().datetime(), endsAt: z.string().datetime() }).parse(req.body);
@@ -239,7 +302,10 @@ export function buildApp(
         startAt: z.string().datetime(),
         customerPhone: z.string().min(8),
         customerName: z.string().optional(),
+        source: z.enum(["HARNESS", "MANUAL", "PHONE", "WALK_IN"]).optional(),
         tenant_id: z.unknown().optional(),
+        customer_id: z.unknown().optional(),
+        target_customer_id: z.unknown().optional(),
       })
       .parse(req.body);
     const ctx = mustTenant(req);
@@ -249,7 +315,7 @@ export function buildApp(
       startAt: new Date(body.startAt),
       customerPhone: body.customerPhone,
       ...(body.customerName !== undefined ? { customerName: body.customerName } : {}),
-      source: "HARNESS",
+      source: body.source ?? "HARNESS",
     });
   });
 

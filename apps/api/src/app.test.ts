@@ -183,4 +183,98 @@ describe("api harness", () => {
     expect(beyond.statusCode).toBe(400);
     expect(beyond.json().error.code).toBe("VALIDATION");
   });
+
+  it("exposes owner schedule, manual booking, and blocked-time paths without accepting customer identity in the body", async () => {
+    const staff = await appA.inject({
+      method: "POST",
+      url: "/v1/staff",
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: { name: "Gil" },
+    });
+    const staffId = staff.json().id as string;
+    const service = await appA.inject({
+      method: "POST",
+      url: "/v1/services",
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: { name: "זקן", durationMinutes: 30, priceMinor: 5000 },
+    });
+    const serviceId = service.json().id as string;
+    await appA.inject({
+      method: "POST",
+      url: `/v1/staff/${staffId}/services`,
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: { serviceId },
+    });
+    const hours = await appA.inject({
+      method: "PUT",
+      url: `/v1/staff/${staffId}/working-hours`,
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: {
+        days: [
+          { dayOfWeek: 0, ranges: [{ startTime: "09:00", endTime: "19:00" }] },
+          { dayOfWeek: 6, ranges: [] },
+        ],
+      },
+    });
+    expect(hours.statusCode).toBe(200);
+    const closed = await appA.inject({
+      method: "POST",
+      url: `/v1/staff/${staffId}/schedule-exceptions`,
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: { civilDate: "2026-09-06", kind: "CLOSED" },
+    });
+    expect(closed.statusCode).toBe(200);
+    const blocked = await appA.inject({
+      method: "POST",
+      url: `/v1/staff/${staffId}/blocked-time`,
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: {
+        startAt: "2026-08-30T14:00:00.000Z",
+        endAt: "2026-08-30T15:00:00.000Z",
+        note: "personal errand",
+        customer_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        customer_phone: "0501112233",
+      },
+    });
+    expect(blocked.statusCode).toBe(200);
+    expect(blocked.json().source).toBe("BLOCKED");
+    expect(blocked.json().customer_id).toBeNull();
+    const avail = await appA.inject({
+      method: "POST",
+      url: "/v1/availability",
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: {
+        serviceId,
+        staffId,
+        from: "2026-08-30T00:00:00.000Z",
+        to: "2026-08-30T20:00:00.000Z",
+      },
+    });
+    const slots = avail.json().slots as { startAt: string }[];
+    expect(slots.some((s) => s.startAt === "2026-08-30T14:00:00.000Z")).toBe(false);
+    const booked = await appA.inject({
+      method: "POST",
+      url: "/v1/appointments",
+      headers: { authorization: `Bearer ${KEY_A}` },
+      payload: {
+        staffId,
+        serviceId,
+        startAt: "2026-08-30T12:00:00.000Z",
+        customerPhone: "0503332211",
+        customerName: "יוסי כהן",
+        source: "PHONE",
+        customer_id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        tenant_id: TENANT_B,
+      },
+    });
+    expect(booked.statusCode).toBe(200);
+    expect(booked.json().source).toBe("PHONE");
+    expect(booked.json().customer_id).not.toBe("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    const asB = await appB.inject({
+      method: "GET",
+      url: `/v1/appointments/${booked.json().id as string}`,
+      headers: { authorization: `Bearer ${KEY_B}` },
+    });
+    expect(asB.statusCode).toBe(404);
+  });
 });

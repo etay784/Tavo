@@ -9,6 +9,8 @@ import {
   insertStaffService,
   insertTimeOff,
   insertWorkingHours,
+  replaceScheduleExceptionsForDate,
+  replaceWorkingHoursForDay,
   withTenant,
 } from "@tavo/database";
 
@@ -110,9 +112,16 @@ export class CatalogService {
     });
   }
 
-  async addTimeOff(ctx: TrustedTenantContext, staffId: string, startsAt: Date, endsAt: Date) {
+  async addTimeOff(
+    ctx: TrustedTenantContext,
+    staffId: string,
+    startsAt: Date,
+    endsAt: Date,
+    reasonOptional?: string,
+  ) {
+    if (!(startsAt < endsAt)) throw Errors.validation("time off range");
     return withTenant(this.pool, ctx.tenantId, async (client) => {
-      const row = await insertTimeOff(client, ctx.tenantId, staffId, startsAt, endsAt);
+      const row = await insertTimeOff(client, ctx.tenantId, staffId, startsAt, endsAt, reasonOptional ?? null);
       await insertAudit(client, ctx.tenantId, {
         actorType: ctx.actorType,
         actorId: ctx.actorId,
@@ -122,6 +131,82 @@ export class CatalogService {
         metadata: { staffId },
       });
       return row;
+    });
+  }
+
+  async setWorkingDayHours(
+    ctx: TrustedTenantContext,
+    staffId: string,
+    dayOfWeek: number,
+    ranges: { startTime: string; endTime: string }[],
+  ) {
+    if (dayOfWeek < 0 || dayOfWeek > 6) throw Errors.validation("dayOfWeek");
+    for (const r of ranges) {
+      if (r.startTime >= r.endTime) throw Errors.validation("working range");
+    }
+    return withTenant(this.pool, ctx.tenantId, async (client) => {
+      const rows = await replaceWorkingHoursForDay(client, ctx.tenantId, staffId, dayOfWeek, ranges);
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "working_hours.set",
+        objectType: "working_hours",
+        objectId: staffId,
+        metadata: { staffId, dayOfWeek, rangeCount: ranges.length },
+      });
+      return rows;
+    });
+  }
+
+  async setDateException(
+    ctx: TrustedTenantContext,
+    staffId: string,
+    civilDate: string,
+    spec: { kind: "CLOSED" } | { kind: "OPEN"; ranges: { startTime: string; endTime: string }[] },
+  ) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(civilDate)) throw Errors.validation("civilDate");
+    const rows =
+      spec.kind === "CLOSED"
+        ? [{ kind: "CLOSED" as const }]
+        : spec.ranges.map((r) => {
+            if (r.startTime >= r.endTime) throw Errors.validation("exception range");
+            return { kind: "OPEN" as const, startTime: r.startTime, endTime: r.endTime };
+          });
+    if (spec.kind === "OPEN" && spec.ranges.length === 0) {
+      throw Errors.validation("exception ranges");
+    }
+    return withTenant(this.pool, ctx.tenantId, async (client) => {
+      const inserted = await replaceScheduleExceptionsForDate(
+        client,
+        ctx.tenantId,
+        staffId,
+        civilDate,
+        rows,
+      );
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "schedule_exception.set",
+        objectType: "staff_schedule_exception",
+        objectId: staffId,
+        metadata: { staffId, civilDate, kind: spec.kind, rangeCount: inserted.length },
+      });
+      return inserted;
+    });
+  }
+
+  async clearDateException(ctx: TrustedTenantContext, staffId: string, civilDate: string) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(civilDate)) throw Errors.validation("civilDate");
+    return withTenant(this.pool, ctx.tenantId, async (client) => {
+      await replaceScheduleExceptionsForDate(client, ctx.tenantId, staffId, civilDate, []);
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "schedule_exception.cleared",
+        objectType: "staff_schedule_exception",
+        objectId: staffId,
+        metadata: { staffId, civilDate },
+      });
     });
   }
 }

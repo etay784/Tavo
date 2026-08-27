@@ -1,8 +1,8 @@
 import { Pool } from "pg";
 import { parseKeyring } from "@tavo/security";
 import { AppointmentService, SchedulingService } from "@tavo/domain";
-import { FakeAIProvider } from "@tavo/ai";
-import { FakeWhatsAppProvider } from "@tavo/whatsapp";
+import { createAIProvider } from "@tavo/ai";
+import { createWhatsAppProvider } from "@tavo/whatsapp";
 import { InboundProcessor, startWorkerLoop } from "@tavo/orchestrator";
 import { systemClock } from "@tavo/shared";
 
@@ -37,14 +37,14 @@ async function main() {
     messages,
     scheduling,
     appointments,
-    new FakeAIProvider(),
+    createAIProvider(),
   );
   const loop = startWorkerLoop({
     pool,
     processor,
     phones,
     messages,
-    provider: new FakeWhatsAppProvider(),
+    provider: createWhatsAppProvider(),
   });
   const shutdown = () => {
     void loop.stop().then(async () => {

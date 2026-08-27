@@ -387,3 +387,7 @@ export class FakeAIProvider implements AIProvider {
     return this.wrapper ?? "";
   }
 }
+
+export { OpenAIResponsesProvider, createAIProvider } from "./factory";
+export { RouteLabelSchema, EVAL_MODEL_CANDIDATES, INTENT_JSON_SCHEMA, ROUTE_JSON_SCHEMA } from "./schemas";
+export type { RouteClassifier } from "./schemas";

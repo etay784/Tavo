@@ -223,3 +223,59 @@ export class FakeWhatsAppProvider implements WhatsAppProvider {
     return { providerMessageId: `wamid-out-${this.sent.length}` };
   }
 }
+
+export class CloudWhatsAppProvider implements WhatsAppProvider {
+  constructor(
+    private readonly accessToken: string,
+    private readonly graphVersion = "v21.0",
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {}
+
+  async sendText(
+    input: { phoneNumberId: string; toE164: string; body: string },
+    signal?: AbortSignal,
+  ): Promise<WhatsAppSendResult> {
+    const url = `https://graph.facebook.com/${this.graphVersion}/${encodeURIComponent(input.phoneNumberId)}/messages`;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: "POST",
+        signal,
+        headers: {
+          authorization: `Bearer ${this.accessToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to: input.toE164,
+          type: "text",
+          text: { body: input.body },
+        }),
+      });
+    } catch (e) {
+      throw new TransientSendError(e instanceof Error ? e.message : "graph fetch");
+    }
+    if (res.status === 429 || res.status >= 500) {
+      throw new TransientSendError(`graph http ${res.status}`);
+    }
+    if (!res.ok) {
+      throw new ClientSendError(`graph http ${res.status}`);
+    }
+    const body: unknown = await res.json();
+    const id =
+      body && typeof body === "object" && "messages" in body
+        ? (body as { messages?: { id?: string }[] }).messages?.[0]?.id
+        : undefined;
+    if (!id) throw new AmbiguousSendError("graph missing message id");
+    return { providerMessageId: id };
+  }
+}
+
+export function createWhatsAppProvider(env: NodeJS.ProcessEnv = process.env): WhatsAppProvider {
+  if (env.TAVO_WHATSAPP_PROVIDER === "cloud") {
+    const token = env.TAVO_META_ACCESS_TOKEN;
+    if (!token) throw new Error("TAVO_META_ACCESS_TOKEN required when TAVO_WHATSAPP_PROVIDER=cloud");
+    return new CloudWhatsAppProvider(token, env.TAVO_META_GRAPH_VERSION ?? "v21.0");
+  }
+  return new FakeWhatsAppProvider();
+}

@@ -607,7 +607,8 @@ export async function listCustomerAppointments(
     `SELECT id, tenant_id, customer_id, staff_id, service_id, location_id,
             start_at, end_at, occupied_start_at, occupied_end_at, status, source
      FROM appointments
-     WHERE tenant_id = $1 AND customer_id = $2 AND status = 'CONFIRMED' AND start_at > $3
+     WHERE tenant_id = $1 AND customer_id = $2 AND customer_id IS NOT NULL
+       AND status = 'CONFIRMED' AND start_at > $3 AND source <> 'BLOCKED'
      ORDER BY start_at`,
     [tenantId, customerId, now],
   );
@@ -668,4 +669,124 @@ export async function consumeLlmBudgetWindow(
     return false;
   }
   return true;
+}
+
+export type RoutingState = "UNKNOWN" | "BUSINESS_VERIFIED" | "PERSONAL_EXCLUDED" | "HUMAN_ONLY";
+export type RoutingSource = "OWNER" | "DETERMINISTIC" | "SYSTEM";
+
+export type ConversationRoutingRow = {
+  tenant_id: string;
+  conversation_id: string;
+  customer_id: string;
+  routing_state: RoutingState;
+  state_source: RoutingSource;
+  owner_locked: boolean;
+  evidence_codes: string[];
+  classifier_invoked_at: Date | null;
+  classifier_label: "BUSINESS" | "UNKNOWN" | null;
+};
+
+export async function customerHasAppointmentHistory(
+  client: PoolClient,
+  tenantId: string,
+  customerId: string,
+): Promise<boolean> {
+  const r = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS(
+       SELECT 1 FROM appointments
+       WHERE tenant_id = $1 AND customer_id = $2
+         AND customer_id IS NOT NULL AND source <> 'BLOCKED'
+     ) AS exists`,
+    [tenantId, customerId],
+  );
+  return r.rows[0]?.exists === true;
+}
+
+export async function getOrCreateConversationRouting(
+  client: PoolClient,
+  tenantId: string,
+  conversationId: string,
+  customerId: string,
+): Promise<ConversationRoutingRow> {
+  const existing = await client.query<ConversationRoutingRow>(
+    `SELECT tenant_id, conversation_id, customer_id, routing_state, state_source,
+            owner_locked, evidence_codes, classifier_invoked_at, classifier_label
+     FROM conversation_routing
+     WHERE tenant_id = $1 AND conversation_id = $2`,
+    [tenantId, conversationId],
+  );
+  if (existing.rows[0]) return existing.rows[0];
+  const inserted = await client.query<ConversationRoutingRow>(
+    `INSERT INTO conversation_routing (
+       tenant_id, conversation_id, customer_id, routing_state, state_source, owner_locked
+     ) VALUES ($1,$2,$3,'UNKNOWN','DETERMINISTIC', false)
+     ON CONFLICT (tenant_id, conversation_id) DO UPDATE SET customer_id = EXCLUDED.customer_id
+     RETURNING tenant_id, conversation_id, customer_id, routing_state, state_source,
+               owner_locked, evidence_codes, classifier_invoked_at, classifier_label`,
+    [tenantId, conversationId, customerId],
+  );
+  return inserted.rows[0]!;
+}
+
+export async function setOwnerConversationRouting(
+  client: PoolClient,
+  tenantId: string,
+  conversationId: string,
+  customerId: string,
+  routingState: RoutingState,
+  evidenceCodes: string[] = ["owner_override"],
+): Promise<ConversationRoutingRow> {
+  await getOrCreateConversationRouting(client, tenantId, conversationId, customerId);
+  const r = await client.query<ConversationRoutingRow>(
+    `UPDATE conversation_routing
+     SET routing_state = $3,
+         state_source = 'OWNER',
+         owner_locked = true,
+         evidence_codes = $4,
+         updated_at = now()
+     WHERE tenant_id = $1 AND conversation_id = $2
+     RETURNING tenant_id, conversation_id, customer_id, routing_state, state_source,
+               owner_locked, evidence_codes, classifier_invoked_at, classifier_label`,
+    [tenantId, conversationId, routingState, evidenceCodes],
+  );
+  return r.rows[0]!;
+}
+
+export async function persistBusinessVerified(
+  client: PoolClient,
+  tenantId: string,
+  conversationId: string,
+  evidenceCodes: string[],
+): Promise<ConversationRoutingRow | null> {
+  const r = await client.query<ConversationRoutingRow>(
+    `UPDATE conversation_routing
+     SET routing_state = 'BUSINESS_VERIFIED',
+         state_source = 'DETERMINISTIC',
+         evidence_codes = $3,
+         updated_at = now()
+     WHERE tenant_id = $1
+       AND conversation_id = $2
+       AND owner_locked = false
+       AND routing_state IN ('UNKNOWN', 'BUSINESS_VERIFIED')
+     RETURNING tenant_id, conversation_id, customer_id, routing_state, state_source,
+               owner_locked, evidence_codes, classifier_invoked_at, classifier_label`,
+    [tenantId, conversationId, evidenceCodes],
+  );
+  return r.rows[0] ?? null;
+}
+
+export async function recordClassifierInvocation(
+  client: PoolClient,
+  tenantId: string,
+  conversationId: string,
+  label: "BUSINESS" | "UNKNOWN",
+): Promise<void> {
+  await client.query(
+    `UPDATE conversation_routing
+     SET classifier_invoked_at = now(),
+         classifier_label = $3,
+         updated_at = now()
+     WHERE tenant_id = $1 AND conversation_id = $2 AND owner_locked = false`,
+    [tenantId, conversationId, label],
+  );
 }

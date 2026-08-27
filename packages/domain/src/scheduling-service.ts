@@ -8,6 +8,7 @@ import {
   listBreaks,
   listEligibleStaff,
   listOccupied,
+  listScheduleExceptions,
   listTimeOff,
   listWorkingHours,
   staffOffersService,
@@ -167,13 +168,29 @@ export class SchedulingService {
   ): Promise<Interval[]> {
     const hours = await listWorkingHours(client, tenantId, staffId);
     const dates = eachCivilDate(from, to, timeZone);
+    const fromCivil = dates[0];
+    const toCivil = dates[dates.length - 1];
+    const exceptions =
+      fromCivil && toCivil
+        ? await listScheduleExceptions(client, tenantId, staffId, fromCivil, toCivil)
+        : [];
     const work: Interval[] = [];
     for (const iso of dates) {
+      const dayEx = exceptions.filter((e) => e.civil_date === iso);
+      if (dayEx.some((e) => e.kind === "CLOSED")) continue;
+      const opens = dayEx.filter((e) => e.kind === "OPEN" && e.start_time && e.end_time);
+      if (opens.length > 0) {
+        for (const row of opens) {
+          work.push(localWorkWindow(iso, row.start_time!, row.end_time!, timeZone));
+        }
+        continue;
+      }
       const dt = DateTime.fromISO(iso, { zone: timeZone });
       const dow = weekdaySunday0(dt);
-      const row = hours.find((h) => Number(h.day_of_week) === dow);
-      if (!row) continue;
-      work.push(localWorkWindow(iso, row.start_time, row.end_time, timeZone));
+      const rows = hours.filter((h) => Number(h.day_of_week) === dow);
+      for (const row of rows) {
+        work.push(localWorkWindow(iso, row.start_time, row.end_time, timeZone));
+      }
     }
     const busyRows = [
       ...(await listBreaks(client, tenantId, staffId, from, to)),

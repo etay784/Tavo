@@ -22,9 +22,11 @@ import {
 } from "@tavo/shared";
 import {
   attachInboundConversation,
+  customerHasAppointmentHistory,
   findCustomerByLookup,
   getBusiness,
   getInboundEvent,
+  getOrCreateConversationRouting,
   getStaff,
   insertAudit,
   insertChatMessage,
@@ -38,6 +40,8 @@ import {
   markInboundDeferred,
   markInboundFailed,
   markInboundProcessed,
+  persistBusinessVerified,
+  recordClassifierInvocation,
   releaseConversationLease,
   tryAcquireConversationLease,
   updateConversationState,
@@ -51,13 +55,16 @@ import {
   IntentSchema,
   MinContextSchema,
   PendingRequestSchema,
+  RouteLabelSchema,
   mergePendingRequest,
   type AIProvider,
   type MinContext,
   type PendingRequest,
+  type RouteClassifier,
   type StructuredIntent,
 } from "@tavo/ai";
 import { consumeLlmBudget, LLM_BUDGET_HE } from "./llm-budget";
+import { decideSilentRouter } from "./silent-router";
 import {
   AMBIGUOUS_SERVICE_HE,
   AMBIGUOUS_STAFF_HE,
@@ -134,6 +141,11 @@ type Prepared = {
   pendingRequest: PendingRequest | null;
 };
 
+type RouterOptions = {
+  classifier?: RouteClassifier;
+  enableClassifier?: boolean;
+};
+
 function newSlotRef(): string {
   return `slot_${randomBytes(16).toString("base64url")}`;
 }
@@ -205,6 +217,7 @@ export class InboundProcessor {
     private readonly appointments: AppointmentService,
     private readonly ai: AIProvider = new FakeAIProvider(),
     private readonly deadlineMs: number = ORCHESTRATOR_DEADLINE_MS,
+    private readonly router: RouterOptions = {},
   ) {}
 
   async processClaimedJob(jobId: string, tenantId: string, _workerId: string): Promise<void> {
@@ -292,6 +305,12 @@ export class InboundProcessor {
     });
     if (!prepared) return;
 
+    const routed = await this.routeTurn(ctx, prepared);
+    if (!routed.allowReceptionist) {
+      await this.applySilence(ctx, prepared, routed.evidenceCodes);
+      return;
+    }
+
     const ac = new AbortController();
     const started = Date.now();
     const timer = setTimeout(() => ac.abort(), this.deadlineMs);
@@ -343,7 +362,7 @@ export class InboundProcessor {
           await markInboundFailed(client, tenantId, jobId, "lost lease", 5, INBOUND_MAX_ATTEMPTS);
           return;
         }
-        if (plan.book || plan.rescheduleFromSlot) {
+        if (plan.book || plan.rescheduleFromSlot || plan.cancelId) {
           await client.query("SAVEPOINT slot_mutate");
           try {
             if (plan.book) {
@@ -354,6 +373,7 @@ export class InboundProcessor {
                 inboundEventId: prepared.inboundId,
                 commandKey: `create:${prepared.inboundId}`,
               });
+              await persistBusinessVerified(client, tenantId, prepared.conversationId, ["booking_success"]);
             }
             if (plan.rescheduleFromSlot) {
               await this.appointments.rescheduleFromOfferedSlot(client, ctx, {
@@ -364,11 +384,30 @@ export class InboundProcessor {
                 commandKey: `reschedule:${prepared.inboundId}`,
                 appointmentId: plan.rescheduleFromSlot.appointmentId,
               });
+              await persistBusinessVerified(client, tenantId, prepared.conversationId, [
+                "appointment_lifecycle",
+              ]);
+            }
+            if (plan.cancelId) {
+              await this.appointments.cancelOnClient(client, ctx, plan.cancelId, {
+                commandKey: `cancel:${prepared.inboundId}`,
+                inboundEventId: prepared.inboundId,
+                customerId: prepared.customerId,
+                notBefore: this.clock.now(),
+              });
+              await persistBusinessVerified(client, tenantId, prepared.conversationId, [
+                "appointment_lifecycle",
+              ]);
             }
           } catch (e) {
             await client.query("ROLLBACK TO SAVEPOINT slot_mutate");
-            if (!isStaleOfferedSlot(e)) throw e;
-            plan = await this.planStaleSlotRecovery(ctx, prepared, plan);
+            if (e instanceof DomainError && e.code === "NOT_FOUND") {
+              plan = idlePlan(NO_BOOKING_HE, plan.intent ?? "UNKNOWN");
+            } else if (!isStaleOfferedSlot(e)) {
+              throw e;
+            } else {
+              plan = await this.planStaleSlotRecovery(ctx, prepared, plan);
+            }
           }
         }
         if (plan.offered && plan.offerSetId) {
@@ -454,6 +493,108 @@ export class InboundProcessor {
     }
   }
 
+  private async routeTurn(
+    ctx: TrustedTenantContext,
+    prepared: Prepared,
+  ): Promise<{ allowReceptionist: boolean; evidenceCodes: string[] }> {
+    const snapshot = await withTenant(this.pool, ctx.tenantId, async (client) => {
+      const routing = await getOrCreateConversationRouting(
+        client,
+        ctx.tenantId,
+        prepared.conversationId,
+        prepared.customerId,
+      );
+      const services = await listServices(client, ctx.tenantId);
+      const staff = await listStaffNames(client, ctx.tenantId);
+      const hasAppointmentHistory = await customerHasAppointmentHistory(
+        client,
+        ctx.tenantId,
+        prepared.customerId,
+      );
+      const sessionOpen = Boolean(
+        prepared.pendingRequest ||
+          prepared.serviceId ||
+          prepared.pendingAppointmentId ||
+          prepared.currentOfferSetId,
+      );
+      return { routing, services, staff, hasAppointmentHistory, sessionOpen };
+    });
+
+    const baseInput = {
+      text: prepared.text,
+      routingState: snapshot.routing.routing_state,
+      ownerLocked: snapshot.routing.owner_locked,
+      conversationState: prepared.state,
+      serviceNames: snapshot.services.map((s) => s.name),
+      staffNames: snapshot.staff.map((s) => s.name),
+      hasAppointmentHistory: snapshot.hasAppointmentHistory,
+      sessionOpen: snapshot.sessionOpen,
+    };
+
+    let decision = decideSilentRouter(baseInput);
+
+    if (
+      !decision.allowReceptionist &&
+      decision.invokeClassifier &&
+      this.router.enableClassifier &&
+      this.router.classifier
+    ) {
+      try {
+        const raw = await this.router.classifier.classifyRoute({ userText: prepared.text });
+        const label = RouteLabelSchema.parse(raw);
+        await withTenant(this.pool, ctx.tenantId, (client) =>
+          recordClassifierInvocation(client, ctx.tenantId, prepared.conversationId, label),
+        );
+        decision = decideSilentRouter({ ...baseInput, classifierLabel: label });
+      } catch {
+        decision = { ...decision, allowReceptionist: false, persistBusinessVerified: false };
+      }
+    }
+
+    if (decision.persistBusinessVerified) {
+      await withTenant(this.pool, ctx.tenantId, (client) =>
+        persistBusinessVerified(client, ctx.tenantId, prepared.conversationId, decision.evidenceCodes),
+      );
+    }
+    return { allowReceptionist: decision.allowReceptionist, evidenceCodes: decision.evidenceCodes };
+  }
+
+  private async applySilence(
+    ctx: TrustedTenantContext,
+    prepared: Prepared,
+    evidenceCodes: string[],
+  ): Promise<void> {
+    await withTenant(this.pool, ctx.tenantId, async (client) => {
+      const still = await lockConversationLease(
+        client,
+        ctx.tenantId,
+        prepared.conversationId,
+        prepared.leaseToken,
+        prepared.lockVersion,
+      );
+      if (!still) {
+        await markInboundFailed(client, ctx.tenantId, prepared.inboundId, "lost lease", 5, INBOUND_MAX_ATTEMPTS);
+        return;
+      }
+      await insertAudit(client, ctx.tenantId, {
+        actorType: ctx.actorType,
+        actorId: ctx.actorId,
+        action: "conversation.router_silence",
+        objectType: "conversation",
+        objectId: prepared.conversationId,
+        metadata: { inboundEventId: prepared.inboundId, evidenceCodes },
+      });
+      await markInboundProcessed(client, ctx.tenantId, prepared.inboundId);
+      await releaseConversationLease(
+        client,
+        ctx.tenantId,
+        prepared.conversationId,
+        prepared.leaseToken,
+        prepared.lockVersion,
+      );
+    });
+  }
+
   private messageKey(): Buffer {
     const k = this.messages.encryptionKeyring.get(this.messages.writeVersion);
     if (!k) throw new Error("message write key missing");
@@ -524,11 +665,23 @@ export class InboundProcessor {
       const services = await listServices(client, ctx.tenantId);
       const staff = await listStaffNames(client, ctx.tenantId);
       const open = await listOpenOfferedSlots(client, ctx.tenantId, prepared.conversationId);
-      const appts = await listCustomerAppointments(
+      const appts = (await listCustomerAppointments(
         client,
         ctx.tenantId,
         prepared.customerId,
         this.clock.now(),
+      )).flatMap((a) =>
+        a.customer_id && a.service_id && a.customer_id === prepared.customerId
+          ? [
+              {
+                id: a.id,
+                staff_id: a.staff_id,
+                service_id: a.service_id,
+                start_at: a.start_at,
+                customer_id: a.customer_id,
+              },
+            ]
+          : [],
       );
       return { allowed, business, services, staff, open, appts };
     });
@@ -1031,7 +1184,11 @@ export class InboundProcessor {
       (parsed.slot_ref ? snap.open.find((s) => s.slot_ref === parsed.slot_ref) : undefined) ??
       (parsed.ordinal ? snap.open.find((s) => s.ordinal === parsed.ordinal) : undefined);
     const appointmentId = prepared.pendingAppointmentId;
-    if (!match || !appointmentId) {
+    const owned = appointmentId ? snap.appts.some((a) => a.id === appointmentId) : false;
+    if (!owned || !appointmentId) {
+      return idlePlan(NO_BOOKING_HE, parsed.intent);
+    }
+    if (!match) {
       return {
         facts: FALLBACK_HE,
         state: "AWAITING_RESCHEDULE_SLOT",

@@ -32,9 +32,9 @@ export type StaffRow = {
 export type AppointmentRow = {
   id: string;
   tenant_id: string;
-  customer_id: string;
+  customer_id: string | null;
   staff_id: string;
-  service_id: string;
+  service_id: string | null;
   location_id: string | null;
   start_at: Date;
   end_at: Date;
@@ -113,6 +113,30 @@ export async function insertStaffService(
   return r.rows[0]!;
 }
 
+export async function replaceWorkingHoursForDay(
+  client: PoolClient,
+  tenantId: string,
+  staffId: string,
+  dayOfWeek: number,
+  ranges: { startTime: string; endTime: string }[],
+) {
+  await client.query(
+    `DELETE FROM working_hours WHERE tenant_id = $1 AND staff_id = $2 AND day_of_week = $3`,
+    [tenantId, staffId, dayOfWeek],
+  );
+  const rows: { id: string; start_time: string; end_time: string }[] = [];
+  for (const range of ranges) {
+    const r = await client.query<{ id: string; start_time: string; end_time: string }>(
+      `INSERT INTO working_hours (tenant_id, staff_id, day_of_week, start_time, end_time)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, start_time::text, end_time::text`,
+      [tenantId, staffId, dayOfWeek, range.startTime, range.endTime],
+    );
+    rows.push(r.rows[0]!);
+  }
+  return rows;
+}
+
 export async function upsertWorkingHours(
   client: PoolClient,
   tenantId: string,
@@ -121,15 +145,10 @@ export async function upsertWorkingHours(
   startTime: string,
   endTime: string,
 ) {
-  const r = await client.query<{ id: string; start_time: string; end_time: string }>(
-    `INSERT INTO working_hours (tenant_id, staff_id, day_of_week, start_time, end_time)
-     VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT (tenant_id, staff_id, day_of_week)
-     DO UPDATE SET start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time, updated_at = now()
-     RETURNING id, start_time::text, end_time::text`,
-    [tenantId, staffId, dayOfWeek, startTime, endTime],
-  );
-  return r.rows[0]!;
+  const rows = await replaceWorkingHoursForDay(client, tenantId, staffId, dayOfWeek, [
+    { startTime, endTime },
+  ]);
+  return rows[0]!;
 }
 
 export const insertWorkingHours = upsertWorkingHours;
@@ -154,12 +173,69 @@ export async function insertTimeOff(
   staffId: string,
   startsAt: Date,
   endsAt: Date,
+  reasonOptional?: string | null,
 ) {
   const r = await client.query<{ id: string }>(
-    `INSERT INTO time_off (tenant_id, staff_id, starts_at, ends_at) VALUES ($1,$2,$3,$4) RETURNING id`,
-    [tenantId, staffId, startsAt, endsAt],
+    `INSERT INTO time_off (tenant_id, staff_id, starts_at, ends_at, reason_optional)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [tenantId, staffId, startsAt, endsAt, reasonOptional ?? null],
   );
   return r.rows[0]!;
+}
+
+export async function replaceScheduleExceptionsForDate(
+  client: PoolClient,
+  tenantId: string,
+  staffId: string,
+  civilDate: string,
+  rows: { kind: "CLOSED" | "OPEN"; startTime?: string | null; endTime?: string | null }[],
+) {
+  await client.query(
+    `DELETE FROM staff_schedule_exceptions
+     WHERE tenant_id = $1 AND staff_id = $2 AND civil_date = $3::date`,
+    [tenantId, staffId, civilDate],
+  );
+  const inserted: { id: string }[] = [];
+  for (const row of rows) {
+    const r = await client.query<{ id: string }>(
+      `INSERT INTO staff_schedule_exceptions (
+         tenant_id, staff_id, civil_date, kind, start_time, end_time
+       ) VALUES ($1,$2,$3::date,$4,$5,$6)
+       RETURNING id`,
+      [
+        tenantId,
+        staffId,
+        civilDate,
+        row.kind,
+        row.startTime ?? null,
+        row.endTime ?? null,
+      ],
+    );
+    inserted.push(r.rows[0]!);
+  }
+  return inserted;
+}
+
+export async function listScheduleExceptions(
+  client: PoolClient,
+  tenantId: string,
+  staffId: string,
+  fromCivil: string,
+  toCivil: string,
+) {
+  const r = await client.query<{
+    civil_date: string;
+    kind: "CLOSED" | "OPEN";
+    start_time: string | null;
+    end_time: string | null;
+  }>(
+    `SELECT civil_date::text AS civil_date, kind, start_time::text, end_time::text
+     FROM staff_schedule_exceptions
+     WHERE tenant_id = $1 AND staff_id = $2
+       AND civil_date >= $3::date AND civil_date <= $4::date`,
+    [tenantId, staffId, fromCivil, toCivil],
+  );
+  return r.rows;
 }
 
 export async function getService(client: PoolClient, tenantId: string, serviceId: string) {
@@ -322,22 +398,23 @@ export async function insertAppointment(
   client: PoolClient,
   tenantId: string,
   input: {
-    customerId: string;
+    customerId: string | null;
     staffId: string;
-    serviceId: string;
+    serviceId: string | null;
     locationId: string | null;
     startAt: Date;
     endAt: Date;
     occupiedStartAt: Date;
     occupiedEndAt: Date;
     source: string;
+    internalNote?: string | null;
   },
 ) {
   const r = await client.query<AppointmentRow>(
     `INSERT INTO appointments (
        tenant_id, customer_id, staff_id, service_id, location_id,
-       start_at, end_at, occupied_start_at, occupied_end_at, status, source
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'CONFIRMED',$10)
+       start_at, end_at, occupied_start_at, occupied_end_at, status, source, internal_note
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'CONFIRMED',$10,$11)
      RETURNING id, tenant_id, customer_id, staff_id, service_id, location_id,
                start_at, end_at, occupied_start_at, occupied_end_at, status, source`,
     [
@@ -351,6 +428,7 @@ export async function insertAppointment(
       input.occupiedStartAt,
       input.occupiedEndAt,
       input.source,
+      input.internalNote ?? null,
     ],
   );
   return r.rows[0]!;
